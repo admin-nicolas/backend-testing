@@ -351,14 +351,25 @@ async def update_lead_proposal(
         if not lead:
             raise HTTPException(status_code=404, detail="Lead not found")
         
+        # Debug: Print received data
+        print(f"Received proposal_data: {proposal_data}")
+        print(f"Status in proposal_data: {'status' in proposal_data}")
+        print(f"Status value: {proposal_data.get('status')}")
+        
         # Update the proposal
         lead.proposal = proposal_data.get("proposal", "")
+        
+        # Update status if provided
+        if "status" in proposal_data:
+            print(f"Updating status from {lead.status} to {proposal_data.get('status')}")
+            lead.status = proposal_data.get("status")
+        
         lead.updated_at = datetime.utcnow()
         
         db.commit()
         db.refresh(lead)
         
-        print(f"Updated proposal for lead {lead_id}")
+        print(f"Updated proposal for lead {lead_id}, status: {lead.status}")
         return {
             "success": True,
             "message": "Proposal updated successfully",
