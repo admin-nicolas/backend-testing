@@ -218,6 +218,8 @@ async def get_leads(db: Session = Depends(get_db)):
                     "platform": lead.platform,
                     "title": lead.title,
                     "budget": lead.budget,
+                    "bids": lead.bids if hasattr(lead, 'bids') else 0,
+                    "cost": lead.cost if hasattr(lead, 'cost') else 0,
                     "posted": lead.posted,
                     "posted_time": lead.posted_time.isoformat() if lead.posted_time else None,
                     "status": lead.status,
@@ -234,6 +236,81 @@ async def get_leads(db: Session = Depends(get_db)):
     except Exception as e:
         print(f"Error fetching leads: {e}")
         return {"leads": []}
+
+@app.get("/api/dashboard/pipeline")
+async def get_pipeline_stats(db: Session = Depends(get_db)):
+    """
+    Get pipeline breakdown with lead counts and values per stage
+    """
+    try:
+        if db is None:
+            return {"pipeline": []}
+        
+        from models import Lead
+        
+        # Define pipeline stages in order
+        stages = ["New", "Proposal Sent", "Approved", "Closed"]
+        
+        # Map database status values to pipeline stages
+        status_mapping = {
+            "Pending": "New",
+            "AI Drafted": "Proposal Sent",
+            "Approved": "Approved",
+            "Closed": "Closed",
+            "Sent": "Proposal Sent",
+            "Won": "Closed",
+            "Lost": "Closed"
+        }
+        
+        # Get all leads
+        all_leads = db.query(Lead).all()
+        
+        # Initialize pipeline data
+        pipeline_data = {stage: {"count": 0, "value": 0} for stage in stages}
+        
+        # Process each lead
+        for lead in all_leads:
+            # Map status to pipeline stage
+            db_status = lead.status or "Pending"
+            stage = status_mapping.get(db_status, "New")
+            
+            # Increment count
+            pipeline_data[stage]["count"] += 1
+            
+            # Extract and add budget value
+            if lead.budget:
+                try:
+                    # Extract numeric value from budget string
+                    budget_str = str(lead.budget).replace('$', '').replace(',', '').strip()
+                    # Handle ranges like "$500-$1000" - take average
+                    if '-' in budget_str:
+                        parts = budget_str.split('-')
+                        low = float(''.join(c for c in parts[0] if c.isdigit() or c == '.'))
+                        high = float(''.join(c for c in parts[1] if c.isdigit() or c == '.'))
+                        value = (low + high) / 2
+                    else:
+                        # Extract first number found
+                        value = float(''.join(c for c in budget_str if c.isdigit() or c == '.'))
+                    pipeline_data[stage]["value"] += int(value)
+                except (ValueError, AttributeError):
+                    pass
+        
+        # Convert to list format
+        pipeline = [
+            {
+                "stage": stage,
+                "count": pipeline_data[stage]["count"],
+                "value": pipeline_data[stage]["value"]
+            }
+            for stage in stages
+        ]
+        
+        return {"pipeline": pipeline}
+    except Exception as e:
+        print(f"Error fetching pipeline stats: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"pipeline": []}
 
 @app.get("/api/dashboard/stats")
 async def get_dashboard_stats(db: Session = Depends(get_db)):
@@ -608,8 +685,12 @@ async def get_settings(email: str = Depends(verify_token), db: Session = Depends
             upwork_job_categories=["Web Development"],
             upwork_max_jobs=3,
             upwork_payment_verified=False,
+            upwork_auto_fetch=False,
+            upwork_auto_fetch_interval=2,
             freelancer_job_category="Web Development",
-            freelancer_max_jobs=3
+            freelancer_max_jobs=3,
+            freelancer_auto_fetch=False,
+            freelancer_auto_fetch_interval=3
         )
         db.add(settings)
         db.commit()
@@ -641,10 +722,18 @@ async def update_settings(
         settings.upwork_max_jobs = settings_data.upwork_max_jobs
     if settings_data.upwork_payment_verified is not None:
         settings.upwork_payment_verified = settings_data.upwork_payment_verified
+    if settings_data.upwork_auto_fetch is not None:
+        settings.upwork_auto_fetch = settings_data.upwork_auto_fetch
+    if settings_data.upwork_auto_fetch_interval is not None:
+        settings.upwork_auto_fetch_interval = settings_data.upwork_auto_fetch_interval
     if settings_data.freelancer_job_category is not None:
         settings.freelancer_job_category = settings_data.freelancer_job_category
     if settings_data.freelancer_max_jobs is not None:
         settings.freelancer_max_jobs = settings_data.freelancer_max_jobs
+    if settings_data.freelancer_auto_fetch is not None:
+        settings.freelancer_auto_fetch = settings_data.freelancer_auto_fetch
+    if settings_data.freelancer_auto_fetch_interval is not None:
+        settings.freelancer_auto_fetch_interval = settings_data.freelancer_auto_fetch_interval
     
     settings.updated_at = datetime.utcnow()
     db.commit()

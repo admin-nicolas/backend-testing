@@ -10,6 +10,8 @@ class Lead(Base):
     title = Column(String, nullable=False)
     category = Column(Text)
     budget = Column(String)
+    bids = Column(Integer, default=0)
+    cost = Column(Integer, default=0)  # For Upwork: 1-10 (low), 10-19 (mid), 20+ (high)
     posted = Column(String)
     posted_time = Column(DateTime)
     status = Column(String, default="Pending")
@@ -38,10 +40,14 @@ class GlobalSettings(Base):
     upwork_job_categories = Column(JSON, default=lambda: ["Web Development"])
     upwork_max_jobs = Column(Integer, default=3)
     upwork_payment_verified = Column(Boolean, default=False)
+    upwork_auto_fetch = Column(Boolean, default=False)
+    upwork_auto_fetch_interval = Column(Integer, default=2)  # in minutes
     
     # Freelancer settings
     freelancer_job_category = Column(String, default="Web Development")
     freelancer_max_jobs = Column(Integer, default=3)
+    freelancer_auto_fetch = Column(Boolean, default=False)
+    freelancer_auto_fetch_interval = Column(Integer, default=3)  # in minutes
     
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
