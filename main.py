@@ -847,7 +847,8 @@ async def get_dashboard_stats(email: str = Depends(verify_token), db: Session = 
         
         # Count by status
         ai_drafted = len([l for l in all_leads if l.status == "AI Drafted"])
-        approved = len([l for l in all_leads if l.status == "Approved"])
+        # Count approved using the new proposal_accepted field
+        approved = len([l for l in all_leads if getattr(l, 'proposal_accepted', False) == True])
         
         # Count Unqualified leads (score < 7 or score is "—")
         low_score = 0
@@ -1523,28 +1524,54 @@ async def get_admin_stats(user = Depends(verify_admin), db: Session = Depends(ge
             if u.freelancer_plus_last_reset and u.freelancer_plus_last_reset.date() == today:
                 today_fetches += u.freelancer_plus_fetch_count or 0
         
-        # Platform breakdown
+        # Platform breakdown with revenue
         platform_counts = {}
+        platform_revenue = {}
         all_leads = db.query(Lead).all()
+        
+        # Calculate total revenue and proposal success rate
+        total_revenue = 0
+        total_proposals_sent = 0
+        total_proposals_accepted = 0
+        
         for lead in all_leads:
             platform = lead.platform or "Unknown"
             platform_counts[platform] = platform_counts.get(platform, 0) + 1
+            
+            # Track revenue per platform
+            lead_revenue = getattr(lead, 'revenue', 0) or 0
+            platform_revenue[platform] = platform_revenue.get(platform, 0) + lead_revenue
+            total_revenue += lead_revenue
+            
+            # Track proposal success
+            if getattr(lead, 'proposal_sent', False):
+                total_proposals_sent += 1
+                if getattr(lead, 'proposal_accepted', False):
+                    total_proposals_accepted += 1
         
         total_with_platform = sum(platform_counts.values())
         platform_breakdown = [
             {
                 "name": platform,
                 "count": count,
-                "percentage": round((count / total_with_platform * 100), 1) if total_with_platform > 0 else 0
+                "percentage": round((count / total_with_platform * 100), 1) if total_with_platform > 0 else 0,
+                "revenue": platform_revenue.get(platform, 0)
             }
             for platform, count in platform_counts.items()
         ]
+        
+        # Calculate success rate
+        success_rate = round((total_proposals_accepted / total_proposals_sent * 100), 1) if total_proposals_sent > 0 else 0
         
         return {
             "totalUsers": total_users,
             "totalLeads": total_leads,
             "todayFetches": today_fetches,
-            "platformBreakdown": platform_breakdown
+            "platformBreakdown": platform_breakdown,
+            "totalRevenue": total_revenue,
+            "proposalsSent": total_proposals_sent,
+            "proposalsAccepted": total_proposals_accepted,
+            "successRate": success_rate
         }
     except Exception as e:
         print(f"Error fetching admin stats: {e}")
@@ -1565,8 +1592,14 @@ async def get_all_users(user = Depends(verify_admin), db: Session = Depends(get_
         users_data = []
         
         for u in all_users:
-            # Count leads for this user
+            # Count total leads for this user
             leads_count = db.query(Lead).filter(Lead.user_id == u.id).count()
+            
+            # Count approved leads (proposal_accepted = True)
+            approved_leads_count = db.query(Lead).filter(
+                Lead.user_id == u.id,
+                Lead.proposal_accepted == True
+            ).count()
             
             users_data.append({
                 "id": u.id,
@@ -1577,6 +1610,7 @@ async def get_all_users(user = Depends(verify_admin), db: Session = Depends(get_
                 "freelancer_fetch_count": u.freelancer_fetch_count or 0,
                 "freelancer_plus_fetch_count": u.freelancer_plus_fetch_count or 0,
                 "leads_count": leads_count,
+                "approved_leads_count": approved_leads_count,
                 "created_at": u.created_at.isoformat() if u.created_at else None
             })
         
@@ -1718,9 +1752,8 @@ async def get_admin_settings(user = Depends(verify_admin), db: Session = Depends
             "default_upwork_limit": system_settings.default_upwork_limit,
             "default_freelancer_limit": system_settings.default_freelancer_limit,
             "default_freelancer_plus_limit": system_settings.default_freelancer_plus_limit,
-            "upwork_webhook_url": system_settings.upwork_webhook_url or os.getenv("UPWORK_WEBHOOK_URL", ""),
-            "freelancer_webhook_url": system_settings.freelancer_webhook_url or os.getenv("FREELANCER_WEBHOOK_URL", ""),
-            "freelancer_plus_webhook_url": system_settings.freelancer_plus_webhook_url or os.getenv("FREELANCER_PLUS_WEBHOOK_URL", "")
+            "default_upwork_max_jobs": getattr(system_settings, 'default_upwork_max_jobs', 3),
+            "default_freelancer_max_jobs": getattr(system_settings, 'default_freelancer_max_jobs', 3)
         }
     except Exception as e:
         print(f"Error fetching admin settings: {e}")
@@ -1740,7 +1773,7 @@ async def update_admin_settings(
         # Get or create system settings
         system_settings = get_system_settings(db)
         
-        # Update limits
+        # Update daily limits
         if "default_upwork_limit" in settings_data:
             system_settings.default_upwork_limit = settings_data["default_upwork_limit"]
         if "default_freelancer_limit" in settings_data:
@@ -1748,19 +1781,18 @@ async def update_admin_settings(
         if "default_freelancer_plus_limit" in settings_data:
             system_settings.default_freelancer_plus_limit = settings_data["default_freelancer_plus_limit"]
         
-        # Update webhook URLs (optional - can still use env vars as fallback)
-        if "upwork_webhook_url" in settings_data:
-            system_settings.upwork_webhook_url = settings_data["upwork_webhook_url"]
-        if "freelancer_webhook_url" in settings_data:
-            system_settings.freelancer_webhook_url = settings_data["freelancer_webhook_url"]
-        if "freelancer_plus_webhook_url" in settings_data:
-            system_settings.freelancer_plus_webhook_url = settings_data["freelancer_plus_webhook_url"]
+        # Update max jobs per fetch
+        if "default_upwork_max_jobs" in settings_data:
+            system_settings.default_upwork_max_jobs = settings_data["default_upwork_max_jobs"]
+        if "default_freelancer_max_jobs" in settings_data:
+            system_settings.default_freelancer_max_jobs = settings_data["default_freelancer_max_jobs"]
         
         system_settings.updated_at = datetime.utcnow()
         db.commit()
         db.refresh(system_settings)
         
-        print(f"✅ Admin settings updated: Upwork={system_settings.default_upwork_limit}, Freelancer={system_settings.default_freelancer_limit}, Freelancer+={system_settings.default_freelancer_plus_limit}")
+        print(f"✅ Admin settings updated: Upwork Limit={system_settings.default_upwork_limit}, Freelancer Limit={system_settings.default_freelancer_limit}, Freelancer+ Limit={system_settings.default_freelancer_plus_limit}")
+        print(f"   Max Jobs: Upwork={getattr(system_settings, 'default_upwork_max_jobs', 3)}, Freelancer={getattr(system_settings, 'default_freelancer_max_jobs', 3)}")
         
         return {
             "success": True,
@@ -1768,7 +1800,9 @@ async def update_admin_settings(
             "settings": {
                 "default_upwork_limit": system_settings.default_upwork_limit,
                 "default_freelancer_limit": system_settings.default_freelancer_limit,
-                "default_freelancer_plus_limit": system_settings.default_freelancer_plus_limit
+                "default_freelancer_plus_limit": system_settings.default_freelancer_plus_limit,
+                "default_upwork_max_jobs": getattr(system_settings, 'default_upwork_max_jobs', 3),
+                "default_freelancer_max_jobs": getattr(system_settings, 'default_freelancer_max_jobs', 3)
             }
         }
     except Exception as e:
@@ -1859,3 +1893,47 @@ async def get_admin_analytics(
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+@app.get("/api/admin/leads")
+async def get_admin_leads(user = Depends(verify_admin), db: Session = Depends(get_db)):
+    """Get all leads from all users for admin analytics"""
+    try:
+        if db is None:
+            return {"leads": []}
+        
+        from models import Lead
+        
+        # Get all leads from all users
+        leads = db.query(Lead).order_by(Lead.updated_at.desc()).all()
+        
+        return {
+            "leads": [
+                {
+                    "id": lead.id,
+                    "platform": lead.platform,
+                    "title": lead.title,
+                    "budget": lead.budget,
+                    "bids": lead.bids if hasattr(lead, 'bids') else 0,
+                    "cost": lead.cost if hasattr(lead, 'cost') else 0,
+                    "posted": lead.posted,
+                    "posted_time": lead.posted_time.isoformat() if lead.posted_time else None,
+                    "status": lead.status,
+                    "score": lead.score,
+                    "description": lead.description,
+                    "category": lead.category if hasattr(lead, 'category') else 'Uncategorized',
+                    "Proposal": lead.proposal,
+                    "proposal_accepted": lead.proposal_accepted if hasattr(lead, 'proposal_accepted') else False,
+                    "url": lead.url,
+                    "avg_bid_price": lead.avg_bid_price if hasattr(lead, 'avg_bid_price') else None,
+                    "created_at": lead.created_at.isoformat() if lead.created_at else None,
+                    "updated_at": lead.updated_at.isoformat() if lead.updated_at else None,
+                    "user_id": lead.user_id
+                }
+                for lead in leads
+            ]
+        }
+    except Exception as e:
+        print(f"❌ Error fetching admin leads: {e}")
+        import traceback
+        traceback.print_exc()
+        return {"leads": []}

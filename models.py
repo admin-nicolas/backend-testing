@@ -22,6 +22,9 @@ class Lead(Base):
     description = Column(Text)
     proposal = Column(Text)
     url = Column(String)
+    revenue = Column(Integer, default=0)  # Revenue generated from this lead (in USD)
+    proposal_sent = Column(Boolean, default=False)  # Whether proposal was sent
+    proposal_accepted = Column(Boolean, default=False)  # Whether proposal was accepted
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     
@@ -112,10 +115,9 @@ class SystemSettings(Base):
     default_freelancer_limit = Column(Integer, default=5)
     default_freelancer_plus_limit = Column(Integer, default=3)
     
-    # Webhook URLs (can be overridden from environment)
-    upwork_webhook_url = Column(String, nullable=True)
-    freelancer_webhook_url = Column(String, nullable=True)
-    freelancer_plus_webhook_url = Column(String, nullable=True)
+    # Default max jobs to fetch per request
+    default_upwork_max_jobs = Column(Integer, default=3)
+    default_freelancer_max_jobs = Column(Integer, default=3)
     
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
