@@ -812,18 +812,8 @@ async def get_leads(email: str = Depends(verify_token), db: Session = Depends(ge
         from models import Lead
         user = get_user_by_email(email, db)
         
-        # Debug: Print user info
-        print(f"🔍 DEBUG - Current user: id={user.id}, email={user.email}")
-        
-        # Debug: Check all leads in database
-        all_leads = db.query(Lead).all()
-        print(f"🔍 DEBUG - Total leads in DB: {len(all_leads)}")
-        for lead in all_leads[:5]:  # Print first 5
-            print(f"   Lead id={lead.id}, user_id={lead.user_id}, title={lead.title[:50]}")
-        
         # Get only this user's visible leads
         leads = db.query(Lead).filter(Lead.user_id == user.id, Lead.visible == True).order_by(Lead.updated_at.desc()).all()
-        print(f"🔍 DEBUG - Visible leads for user {user.id}: {len(leads)}")
         
         return {
             "leads": [
