@@ -25,6 +25,7 @@ class Lead(Base):
     revenue = Column(Integer, default=0)  # Revenue generated from this lead (in USD)
     proposal_sent = Column(Boolean, default=False)  # Whether proposal was sent
     proposal_accepted = Column(Boolean, default=False)  # Whether proposal was accepted
+    visible = Column(Boolean, default=True)  # Whether the lead is visible to the user
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
     

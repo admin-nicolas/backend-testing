@@ -90,155 +90,180 @@ def check_and_reset_daily_limit(user: User, platform: str, db: Session):
 
 
 async def fetch_upwork_for_user(user_id: int, user_email: str, settings: UserSettings):
-    """Fetch Upwork jobs for a specific user"""
+    """Check and fetch Upwork jobs if interval passed"""
     db = get_db()
     if not db:
         return
     
     try:
+        # Get fresh user and settings from database
         user = db.query(User).filter(User.id == user_id).first()
         if not user:
-            logger.warning(f"User {user_email} not found")
             return
         
-        # Check if auto-fetch is enabled
-        if not settings.upwork_auto_fetch:
+        # Get fresh settings
+        fresh_settings = db.query(UserSettings).filter(UserSettings.user_id == user_id).first()
+        if not fresh_settings:
             return
         
-        # Check if enough time has passed since last fetch
         now = datetime.utcnow()
-        interval_minutes = settings.upwork_auto_fetch_interval or 2
+        interval_minutes = fresh_settings.upwork_auto_fetch_interval or 2
         
-        if settings.upwork_last_auto_fetch:
-            time_since_last = (now - settings.upwork_last_auto_fetch).total_seconds() / 60
+        # Check if enough time passed since last fetch
+        if fresh_settings.upwork_last_auto_fetch:
+            time_since_last = (now - fresh_settings.upwork_last_auto_fetch).total_seconds() / 60
             if time_since_last < interval_minutes:
-                logger.debug(f"[Upwork] Skipping {user_email} - only {time_since_last:.1f} min since last fetch (need {interval_minutes})")
-                return  # Not enough time passed
+                return  # Not time yet
+        else:
+            # First time - set the time and wait for next interval
+            fresh_settings.upwork_last_auto_fetch = now
+            db.commit()
+            logger.info(f"[Upwork] Auto-fetch enabled for {user_email}, will fetch in {interval_minutes} min")
+            return
         
-        # Check and reset daily limit
+        # Check daily limit
         current_count, daily_limit, can_fetch = check_and_reset_daily_limit(user, "upwork", db)
         
         if not can_fetch:
-            logger.warning(f"Upwork daily limit reached for {user_email}, disabling auto-fetch")
             settings.upwork_auto_fetch = False
             db.commit()
+            logger.info(f"[Upwork] Limit reached for {user_email}, disabled")
             return
         
         # Trigger webhook
         if not UPWORK_WEBHOOK_URL:
-            logger.error("UPWORK_WEBHOOK_URL not configured")
             return
         
-        logger.info(f"[Auto-Fetch] Triggering Upwork for {user_email} at {now.strftime('%H:%M:%S')}")
+        logger.info(f"[Upwork] Fetching for {user_email}")
+        
+        # Prepare payload and headers with API key
+        payload = {
+            "user_id": user.id,
+            "user_email": user_email,
+            "settings": {
+                "job_categories": fresh_settings.upwork_job_categories,
+                "max_jobs": fresh_settings.upwork_max_jobs,
+                "payment_verified": fresh_settings.upwork_payment_verified
+            }
+        }
+        
+        headers = {"Content-Type": "application/json"}
+        api_key = os.getenv("N8N_WEBHOOK_API_KEY")
+        if api_key:
+            headers["X-API-Key"] = api_key
         
         async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                UPWORK_WEBHOOK_URL,
-                json={"user_email": user_email}
-            )
+            response = await client.post(UPWORK_WEBHOOK_URL, json=payload, headers=headers)
             
             if response.status_code == 200:
-                # Update last fetch time in database
-                settings.upwork_last_auto_fetch = now
-                
-                # Increment fetch count
+                fresh_settings.upwork_last_auto_fetch = now
                 user.upwork_fetch_count = (user.upwork_fetch_count or 0) + 1
                 db.commit()
                 
                 remaining = daily_limit - user.upwork_fetch_count
-                logger.info(f"[Auto-Fetch] Upwork success for {user_email}. Remaining: {remaining}/{daily_limit}")
+                logger.info(f"[Upwork] Success. Remaining: {remaining}/{daily_limit}")
                 
-                # Disable if limit reached
                 if remaining <= 0:
-                    settings.upwork_auto_fetch = False
+                    fresh_settings.upwork_auto_fetch = False
                     db.commit()
-                    logger.warning(f"[Auto-Fetch] Upwork limit reached for {user_email}, auto-fetch disabled")
             else:
-                logger.error(f"[Auto-Fetch] Upwork failed for {user_email}: {response.status_code}")
+                logger.error(f"[Upwork] Failed: {response.status_code}")
     
     except Exception as e:
-        logger.error(f"[Auto-Fetch] Upwork error for {user_email}: {e}")
+        logger.error(f"[Upwork] Error: {e}")
     finally:
         if db:
             db.close()
 
 
 async def fetch_freelancer_for_user(user_id: int, user_email: str, settings: UserSettings):
-    """Fetch Freelancer jobs for a specific user"""
+    """Check and fetch Freelancer jobs if interval passed"""
     db = get_db()
     if not db:
         return
     
     try:
+        # Get fresh user and settings from database
         user = db.query(User).filter(User.id == user_id).first()
         if not user:
-            logger.warning(f"User {user_email} not found")
             return
         
-        # Check if auto-fetch is enabled
-        if not settings.freelancer_auto_fetch:
+        # Get fresh settings
+        fresh_settings = db.query(UserSettings).filter(UserSettings.user_id == user_id).first()
+        if not fresh_settings:
             return
         
-        # Check if enough time has passed since last fetch
         now = datetime.utcnow()
-        interval_minutes = settings.freelancer_auto_fetch_interval or 3
+        interval_minutes = fresh_settings.freelancer_auto_fetch_interval or 3
         
-        if settings.freelancer_last_auto_fetch:
-            time_since_last = (now - settings.freelancer_last_auto_fetch).total_seconds() / 60
+        # Check if enough time passed since last fetch
+        if fresh_settings.freelancer_last_auto_fetch:
+            time_since_last = (now - fresh_settings.freelancer_last_auto_fetch).total_seconds() / 60
             if time_since_last < interval_minutes:
-                logger.debug(f"[Freelancer] Skipping {user_email} - only {time_since_last:.1f} min since last fetch (need {interval_minutes})")
-                return  # Not enough time passed
+                return  # Not time yet
+        else:
+            # First time - set the time and wait for next interval
+            fresh_settings.freelancer_last_auto_fetch = now
+            db.commit()
+            logger.info(f"[Freelancer] Auto-fetch enabled for {user_email}, will fetch in {interval_minutes} min")
+            return
         
-        # Check and reset daily limit
+        # Check daily limit
         current_count, daily_limit, can_fetch = check_and_reset_daily_limit(user, "freelancer", db)
         
         if not can_fetch:
-            logger.warning(f"Freelancer daily limit reached for {user_email}, disabling auto-fetch")
             settings.freelancer_auto_fetch = False
             db.commit()
+            logger.info(f"[Freelancer] Limit reached for {user_email}, disabled")
             return
         
         # Trigger webhook
         if not FREELANCER_WEBHOOK_URL:
-            logger.error("FREELANCER_WEBHOOK_URL not configured")
             return
         
-        logger.info(f"[Auto-Fetch] Triggering Freelancer for {user_email} at {now.strftime('%H:%M:%S')}")
+        logger.info(f"[Freelancer] Fetching for {user_email}")
+        
+        # Prepare payload and headers with API key
+        payload = {
+            "user_id": user.id,
+            "user_email": user_email,
+            "settings": {
+                "job_category": fresh_settings.freelancer_job_category,
+                "max_jobs": fresh_settings.freelancer_max_jobs
+            }
+        }
+        
+        headers = {"Content-Type": "application/json"}
+        api_key = os.getenv("N8N_WEBHOOK_API_KEY")
+        if api_key:
+            headers["X-API-Key"] = api_key
         
         async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(
-                FREELANCER_WEBHOOK_URL,
-                json={"user_email": user_email}
-            )
+            response = await client.post(FREELANCER_WEBHOOK_URL, json=payload, headers=headers)
             
             if response.status_code == 200:
-                # Update last fetch time in database
-                settings.freelancer_last_auto_fetch = now
-                
-                # Increment fetch count
+                fresh_settings.freelancer_last_auto_fetch = now
                 user.freelancer_fetch_count = (user.freelancer_fetch_count or 0) + 1
                 db.commit()
                 
                 remaining = daily_limit - user.freelancer_fetch_count
-                logger.info(f"[Auto-Fetch] Freelancer success for {user_email}. Remaining: {remaining}/{daily_limit}")
+                logger.info(f"[Freelancer] Success. Remaining: {remaining}/{daily_limit}")
                 
-                # Disable if limit reached
                 if remaining <= 0:
-                    settings.freelancer_auto_fetch = False
+                    fresh_settings.freelancer_auto_fetch = False
                     db.commit()
-                    logger.warning(f"[Auto-Fetch] Freelancer limit reached for {user_email}, auto-fetch disabled")
             else:
-                logger.error(f"[Auto-Fetch] Freelancer failed for {user_email}: {response.status_code}")
+                logger.error(f"[Freelancer] Failed: {response.status_code}")
     
     except Exception as e:
-        logger.error(f"[Auto-Fetch] Freelancer error for {user_email}: {e}")
+        logger.error(f"[Freelancer] Error: {e}")
     finally:
         if db:
             db.close()
 
 
 def check_and_run_auto_fetch():
-    """Check all users and run auto-fetch for those who have it enabled"""
+    """Check every 1 minute for users with auto-fetch enabled"""
     db = get_db()
     if not db:
         return
@@ -247,9 +272,6 @@ def check_and_run_auto_fetch():
         # Get all user settings with auto-fetch enabled
         settings_upwork = db.query(UserSettings).filter(UserSettings.upwork_auto_fetch == True).all()
         settings_freelancer = db.query(UserSettings).filter(UserSettings.freelancer_auto_fetch == True).all()
-        
-        if settings_upwork or settings_freelancer:
-            logger.info(f"[Scheduler] Checking auto-fetch: {len(settings_upwork)} Upwork, {len(settings_freelancer)} Freelancer")
         
         # Process Upwork users
         for settings in settings_upwork:
@@ -264,7 +286,7 @@ def check_and_run_auto_fetch():
                 asyncio.run(fetch_freelancer_for_user(user.id, user.email, settings))
     
     except Exception as e:
-        logger.error(f"[Scheduler] Error in check_and_run_auto_fetch: {e}")
+        logger.error(f"[Scheduler] Error: {e}")
     finally:
         if db:
             db.close()

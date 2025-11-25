@@ -14,7 +14,7 @@ load_dotenv()
 
 app = FastAPI()
 
-# Import and start background scheduler
+# Background scheduler - checks every 1 minute for auto-fetch
 try:
     from scheduler import start_scheduler, stop_scheduler
     
@@ -22,13 +22,13 @@ try:
     async def startup_event():
         """Start background scheduler on app startup"""
         start_scheduler()
-        print("[Startup] Background auto-fetch scheduler initialized")
+        print("[Startup] Auto-fetch scheduler started")
     
     @app.on_event("shutdown")
     async def shutdown_event():
         """Stop background scheduler on app shutdown"""
         stop_scheduler()
-        print("[Shutdown] Background auto-fetch scheduler stopped")
+        print("[Shutdown] Auto-fetch scheduler stopped")
 except Exception as e:
     print(f"[Warning] Could not initialize scheduler: {e}")
 
@@ -679,17 +679,57 @@ async def fetch_freelancer_plus(email: str = Depends(verify_token), db: Session 
 
 @app.get("/api/fetch-limits")
 async def get_fetch_limits(email: str = Depends(verify_token), db: Session = Depends(get_db)):
-    """Get remaining fetches for all platforms"""
+    """Get remaining fetches for all platforms and trigger auto-fetch if needed"""
     try:
         if db is None:
             raise HTTPException(status_code=500, detail="Database connection failed")
         
+        from models import UserSettings
         user = get_user_by_email(email, db)
+        settings = db.query(UserSettings).filter(UserSettings.user_id == user.id).first()
         
         # Check and reset for each platform
         upwork_count, upwork_limit, upwork_can_fetch, upwork_remaining = check_and_reset_daily_limit(user, "upwork", db)
         freelancer_count, freelancer_limit, freelancer_can_fetch, freelancer_remaining = check_and_reset_daily_limit(user, "freelancer", db)
         freelancer_plus_count, freelancer_plus_limit, freelancer_plus_can_fetch, freelancer_plus_remaining = check_and_reset_daily_limit(user, "freelancer_plus", db)
+        
+        # Check if auto-fetch should trigger
+        if settings:
+            now = datetime.utcnow()
+            
+            # Check Upwork auto-fetch
+            if settings.upwork_auto_fetch and upwork_can_fetch:
+                interval_minutes = settings.upwork_auto_fetch_interval or 2
+                should_fetch = False
+                
+                if settings.upwork_last_auto_fetch is None:
+                    should_fetch = True
+                else:
+                    time_since_last = (now - settings.upwork_last_auto_fetch).total_seconds() / 60
+                    if time_since_last >= interval_minutes:
+                        should_fetch = True
+                
+                if should_fetch:
+                    # Trigger fetch in background
+                    import asyncio
+                    asyncio.create_task(trigger_upwork_fetch(user.email, user.id, settings, db))
+            
+            # Check Freelancer auto-fetch
+            if settings.freelancer_auto_fetch and freelancer_can_fetch:
+                interval_minutes = settings.freelancer_auto_fetch_interval or 3
+                should_fetch = False
+                
+                if settings.freelancer_last_auto_fetch is None:
+                    should_fetch = True
+                else:
+                    time_since_last = (now - settings.freelancer_last_auto_fetch).total_seconds() / 60
+                    if time_since_last >= interval_minutes:
+                        should_fetch = True
+                
+                if should_fetch:
+                    # Trigger fetch in background
+                    import asyncio
+                    asyncio.create_task(trigger_freelancer_fetch(user.email, user.id, settings, db))
         
         return {
             "upwork": {
@@ -719,6 +759,50 @@ async def get_fetch_limits(email: str = Depends(verify_token), db: Session = Dep
             "freelancer_plus": {"fetch_count": 0, "daily_limit": 5, "remaining": 5, "can_fetch": True}
         }
 
+async def trigger_upwork_fetch(email: str, user_id: int, settings, db: Session):
+    """Trigger Upwork fetch in background"""
+    try:
+        from models import User
+        UPWORK_WEBHOOK_URL = os.getenv('UPWORK_WEBHOOK_URL')
+        if not UPWORK_WEBHOOK_URL:
+            return
+        
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(UPWORK_WEBHOOK_URL, json={"user_email": email})
+            
+            if response.status_code == 200:
+                # Update last fetch time and count
+                user = db.query(User).filter(User.id == user_id).first()
+                if user:
+                    settings.upwork_last_auto_fetch = datetime.utcnow()
+                    user.upwork_fetch_count = (user.upwork_fetch_count or 0) + 1
+                    db.commit()
+                    print(f"[Auto-Fetch] Upwork triggered for {email}")
+    except Exception as e:
+        print(f"[Auto-Fetch] Upwork error: {e}")
+
+async def trigger_freelancer_fetch(email: str, user_id: int, settings, db: Session):
+    """Trigger Freelancer fetch in background"""
+    try:
+        from models import User
+        FREELANCER_WEBHOOK_URL = os.getenv('FREELANCER_WEBHOOK_URL')
+        if not FREELANCER_WEBHOOK_URL:
+            return
+        
+        async with httpx.AsyncClient(timeout=60.0) as client:
+            response = await client.post(FREELANCER_WEBHOOK_URL, json={"user_email": email})
+            
+            if response.status_code == 200:
+                # Update last fetch time and count
+                user = db.query(User).filter(User.id == user_id).first()
+                if user:
+                    settings.freelancer_last_auto_fetch = datetime.utcnow()
+                    user.freelancer_fetch_count = (user.freelancer_fetch_count or 0) + 1
+                    db.commit()
+                    print(f"[Auto-Fetch] Freelancer triggered for {email}")
+    except Exception as e:
+        print(f"[Auto-Fetch] Freelancer error: {e}")
+
 @app.get("/api/leads")
 async def get_leads(email: str = Depends(verify_token), db: Session = Depends(get_db)):
     try:
@@ -737,9 +821,9 @@ async def get_leads(email: str = Depends(verify_token), db: Session = Depends(ge
         for lead in all_leads[:5]:  # Print first 5
             print(f"   Lead id={lead.id}, user_id={lead.user_id}, title={lead.title[:50]}")
         
-        # Get only this user's leads
-        leads = db.query(Lead).filter(Lead.user_id == user.id).order_by(Lead.updated_at.desc()).all()
-        print(f"🔍 DEBUG - Leads for user {user.id}: {len(leads)}")
+        # Get only this user's visible leads
+        leads = db.query(Lead).filter(Lead.user_id == user.id, Lead.visible == True).order_by(Lead.updated_at.desc()).all()
+        print(f"🔍 DEBUG - Visible leads for user {user.id}: {len(leads)}")
         
         return {
             "leads": [
@@ -1071,23 +1155,23 @@ async def clean_leads(email: str = Depends(verify_token), db: Session = Depends(
         from models import Lead
         user = get_user_by_email(email, db)
         
-        # Log before deletion
+        # Log before hiding
         total_leads_before = db.query(Lead).count()
-        user_leads_before = db.query(Lead).filter(Lead.user_id == user.id).count()
+        user_leads_before = db.query(Lead).filter(Lead.user_id == user.id, Lead.visible == True).count()
         print(f"[CLEAN LEADS] User: {user.email} (ID: {user.id})")
         print(f"[CLEAN LEADS] Total leads in DB: {total_leads_before}")
-        print(f"[CLEAN LEADS] User's leads: {user_leads_before}")
+        print(f"[CLEAN LEADS] User's visible leads: {user_leads_before}")
         
-        # Delete only this user's leads
-        deleted_count = db.query(Lead).filter(Lead.user_id == user.id).delete()
+        # Hide only this user's visible leads by setting visible=False
+        hidden_count = db.query(Lead).filter(Lead.user_id == user.id, Lead.visible == True).update({"visible": False})
         db.commit()
         
-        # Log after deletion
-        total_leads_after = db.query(Lead).count()
-        print(f"[CLEAN LEADS] Deleted: {deleted_count} leads")
-        print(f"[CLEAN LEADS] Total leads remaining: {total_leads_after}")
+        # Log after hiding
+        user_visible_after = db.query(Lead).filter(Lead.user_id == user.id, Lead.visible == True).count()
+        print(f"[CLEAN LEADS] Hidden: {hidden_count} leads")
+        print(f"[CLEAN LEADS] User's visible leads remaining: {user_visible_after}")
         
-        return {"success": True, "message": f"Deleted {deleted_count} leads for {user.email}", "count": deleted_count}
+        return {"success": True, "message": f"Hidden {hidden_count} leads for {user.email}", "count": hidden_count}
     except Exception as e:
         print(f"Error cleaning leads: {e}")
         if db:
