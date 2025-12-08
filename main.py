@@ -427,7 +427,7 @@ async def fetch_upwork(email: str = Depends(verify_token), db: Session = Depends
         else:
             print("WARNING: N8N_WEBHOOK_API_KEY not set - webhook may fail authentication")
         
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=600.0) as client:
             response = await client.post(
                 webhook_url,
                 json=payload,
@@ -527,7 +527,7 @@ async def fetch_freelancer(email: str = Depends(verify_token), db: Session = Dep
         else:
             print("WARNING: N8N_WEBHOOK_API_KEY not set - webhook may fail authentication")
         
-        async with httpx.AsyncClient(timeout=60.0) as client:
+        async with httpx.AsyncClient(timeout=600.0) as client:
             response = await client.post(
                 webhook_url,
                 json=payload,
@@ -627,7 +627,7 @@ async def fetch_freelancer_plus(email: str = Depends(verify_token), db: Session 
         else:
             print("WARNING: N8N_WEBHOOK_API_KEY not set - webhook may fail authentication")
         
-        async with httpx.AsyncClient(timeout=180.0) as client:
+        async with httpx.AsyncClient(timeout=600.0) as client:
             response = await client.post(
                 webhook_url,
                 json=payload,
