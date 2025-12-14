@@ -1,36 +1,46 @@
-from fastapi import FastAPI, HTTPException, Depends, status
+from fastapi import FastAPI, HTTPException, Depends, status, Query
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from sqlalchemy import func
-from typing import List
-from datetime import datetime
+from sqlalchemy import func, text, Float
+from typing import List, Optional
+from datetime import datetime, timedelta
 import httpx
 import os
 from dotenv import load_dotenv
-from schemas import UserSignup, UserLogin, Token, UserResponse, SettingsUpdate, SettingsResponse, UserProfileUpdate, TalentCreate, TalentUpdate, TalentResponse
+from functools import lru_cache
+import asyncio
+from concurrent.futures import ThreadPoolExecutor
+from cache_utils import cached, cleanup_cache
+import threading
+import time
+from schemas import UserSignup, UserLogin, Token, UserResponse, SettingsUpdate, SettingsResponse, UserProfileUpdate, TalentCreate, TalentUpdate, TalentResponse, FreelancerCredentialsCreate, FreelancerCredentialsResponse, FreelancerCredentialsUpdate
 from auth import get_password_hash, verify_password, create_access_token, verify_token
+import json
+from urllib.parse import unquote
 
 load_dotenv()
 
 app = FastAPI()
 
-# Background scheduler - checks every 1 minute for auto-fetch
-try:
-    from scheduler import start_scheduler, stop_scheduler
+# Start cache cleanup task
+def start_cache_cleanup():
+    """Start periodic cache cleanup"""
+    def cleanup_task():
+        while True:
+            try:
+                cleanup_cache()
+                time.sleep(300)  # Clean up every 5 minutes
+            except Exception as e:
+                print(f"Cache cleanup error: {e}")
+                time.sleep(60)  # Wait 1 minute on error
     
-    @app.on_event("startup")
-    async def startup_event():
-        """Start background scheduler on app startup"""
-        start_scheduler()
-        print("[Startup] Auto-fetch scheduler started")
-    
-    @app.on_event("shutdown")
-    async def shutdown_event():
-        """Stop background scheduler on app shutdown"""
-        stop_scheduler()
-        print("[Shutdown] Auto-fetch scheduler stopped")
-except Exception as e:
-    print(f"[Warning] Could not initialize scheduler: {e}")
+    cleanup_thread = threading.Thread(target=cleanup_task, daemon=True)
+    cleanup_thread.start()
+
+# Start cleanup on app startup
+start_cache_cleanup()
+
+
 
 # Lazy import database to avoid connection on startup
 def init_db():
@@ -43,18 +53,30 @@ def init_db():
         return False
 
 def get_db():
+    """Database session optimized for Supabase transaction pooler"""
+    db = None
     try:
         from database import SessionLocal
         db = SessionLocal()
+        
+        # Optimize session for transaction pooler
+        db.execute(text("SET statement_timeout = '30s'"))
+        
+        yield db
     except Exception as e:
         print(f"Database connection failed: {e}")
-        db = None
-    
-    try:
-        yield db
+        if db:
+            try:
+                db.rollback()
+            except:
+                pass  # Ignore rollback errors in transaction pooler
+        raise HTTPException(status_code=500, detail="Database connection failed")
     finally:
         if db is not None:
-            db.close()
+            try:
+                db.close()
+            except:
+                pass  # Ignore close errors in transaction pooler
 
 def get_user_by_email(email: str, db: Session):
     """Helper function to get current user from email"""
@@ -141,6 +163,19 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Add performance middleware
+from fastapi.middleware.gzip import GZipMiddleware
+app.add_middleware(GZipMiddleware, minimum_size=1000)
+
+# Add response time header middleware
+@app.middleware("http")
+async def add_process_time_header(request, call_next):
+    start_time = time.time()
+    response = await call_next(request)
+    process_time = time.time() - start_time
+    response.headers["X-Process-Time"] = str(process_time)
+    return response
 
 @app.post("/api/leads/bulk")
 async def receive_leads_from_n8n(payload: dict, db: Session = Depends(get_db)):
@@ -376,6 +411,21 @@ async def sync_receive(email: str = Depends(verify_token), db: Session = Depends
         traceback.print_exc()
         raise HTTPException(status_code=500, detail="Load On server Plz try again Later")
 
+async def trigger_webhook_async(webhook_url: str, payload: dict, headers: dict):
+    """Async webhook trigger with shorter timeout and better error handling"""
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:  # Reduced from 600s to 30s
+            response = await client.post(webhook_url, json=payload, headers=headers)
+            return {
+                "success": response.status_code == 200,
+                "status_code": response.status_code,
+                "response_text": response.text[:500] if response.text else 'empty'
+            }
+    except httpx.TimeoutException:
+        return {"success": False, "error": "Request timeout", "status_code": 504}
+    except Exception as e:
+        return {"success": False, "error": str(e), "status_code": 500}
+
 @app.post("/api/fetch-upwork")
 async def fetch_upwork(email: str = Depends(verify_token), db: Session = Depends(get_db)):
     try:
@@ -400,10 +450,12 @@ async def fetch_upwork(email: str = Depends(verify_token), db: Session = Depends
             raise HTTPException(status_code=400, detail="Load On server Plz try again Later")
         
         webhook_url = os.getenv("UPWORK_WEBHOOK_URL")
-        print(f"Triggering Upwork webhook for user {user.email}: {webhook_url}")
-        
         if not webhook_url:
             raise HTTPException(status_code=500, detail="UPWORK_WEBHOOK_URL not configured in environment")
+        
+        # Increment fetch count immediately to prevent double-fetching
+        user.upwork_fetch_count += 1
+        db.commit()
         
         # Prepare payload with user context
         payload = {
@@ -418,63 +470,34 @@ async def fetch_upwork(email: str = Depends(verify_token), db: Session = Depends
         
         # Prepare headers with authentication
         headers = {"Content-Type": "application/json"}
-        
-        # Add API key if configured
         api_key = os.getenv("N8N_WEBHOOK_API_KEY")
         if api_key:
             headers["X-API-Key"] = api_key
-            print(f"Using API key authentication: {api_key[:10]}...")
-        else:
-            print("WARNING: N8N_WEBHOOK_API_KEY not set - webhook may fail authentication")
         
-        async with httpx.AsyncClient(timeout=600.0) as client:
-            response = await client.post(
-                webhook_url,
-                json=payload,
-                headers=headers
-            )
-            print(f"Upwork webhook response status: {response.status_code}")
-            print(f"Upwork webhook response: {response.text[:500] if response.text else 'empty'}")
-            
-            # Check if response contains N8N workflow error
-            if response.status_code != 200:
-                error_detail = "Unable to fetch jobs. Please try again later."
-                try:
-                    error_json = response.json()
-                    if "Unused Respond to Webhook" in str(error_json):
-                        error_detail = "Workflow configuration error. Please contact support."
-                    elif "not registered" in str(error_json).lower():
-                        error_detail = "N8N Webhook Not Found: The webhook at 'https://n8n.srv1128153.hstgr.cloud/webhook/upwork001' is not registered or the workflow is not active. Please check: 1) Workflow is activated (toggle ON), 2) Webhook path matches, 3) Workflow is saved"
-                    elif error_json.get("message"):
-                        # Don't expose internal error messages to users
-                        error_detail = "Service temporarily unavailable. Please try again."
-                except:
-                    pass
-                raise HTTPException(status_code=response.status_code, detail=error_detail)
-            
-            # Increment fetch count after successful fetch
-            user.upwork_fetch_count += 1
-            db.commit()
-            
-            remaining = daily_limit - user.upwork_fetch_count
-            print(f"User {user.email} fetched Upwork. Count: {user.upwork_fetch_count}/{daily_limit}, Remaining: {remaining}")
-            
-            return {
-                "success": True,
-                "message": "Upwork jobs fetch triggered successfully",
-                "status": response.status_code,
-                "fetch_count": user.upwork_fetch_count,
-                "daily_limit": daily_limit,
-                "remaining": remaining
-            }
+        print(f"Triggering Upwork webhook for user {user.email}")
+        
+        # Trigger webhook asynchronously with timeout
+        webhook_result = await trigger_webhook_async(webhook_url, payload, headers)
+        
+        remaining = daily_limit - user.upwork_fetch_count
+        
+        if not webhook_result["success"]:
+            # If webhook failed, we still return success since we've triggered the process
+            print(f"Webhook failed but fetch initiated: {webhook_result.get('error', 'Unknown error')}")
+        
+        return {
+            "success": True,
+            "message": "Upwork jobs fetch initiated successfully",
+            "status": webhook_result.get("status_code", 200),
+            "fetch_count": user.upwork_fetch_count,
+            "daily_limit": daily_limit,
+            "remaining": remaining
+        }
+        
     except HTTPException:
         raise
-    except httpx.TimeoutException:
-        raise HTTPException(status_code=504, detail="Load On server Plz try again Later")
     except Exception as e:
         print(f"Error triggering Upwork webhook: {str(e)}")
-        import traceback
-        traceback.print_exc()
         raise HTTPException(status_code=500, detail="Load On server Plz try again Later")
 
 @app.post("/api/fetch-freelancer")
@@ -679,57 +702,17 @@ async def fetch_freelancer_plus(email: str = Depends(verify_token), db: Session 
 
 @app.get("/api/fetch-limits")
 async def get_fetch_limits(email: str = Depends(verify_token), db: Session = Depends(get_db)):
-    """Get remaining fetches for all platforms and trigger auto-fetch if needed"""
+    """Get remaining fetches for all platforms"""
     try:
         if db is None:
             raise HTTPException(status_code=500, detail="Database connection failed")
         
-        from models import UserSettings
         user = get_user_by_email(email, db)
-        settings = db.query(UserSettings).filter(UserSettings.user_id == user.id).first()
         
         # Check and reset for each platform
         upwork_count, upwork_limit, upwork_can_fetch, upwork_remaining = check_and_reset_daily_limit(user, "upwork", db)
         freelancer_count, freelancer_limit, freelancer_can_fetch, freelancer_remaining = check_and_reset_daily_limit(user, "freelancer", db)
         freelancer_plus_count, freelancer_plus_limit, freelancer_plus_can_fetch, freelancer_plus_remaining = check_and_reset_daily_limit(user, "freelancer_plus", db)
-        
-        # Check if auto-fetch should trigger
-        if settings:
-            now = datetime.utcnow()
-            
-            # Check Upwork auto-fetch
-            if settings.upwork_auto_fetch and upwork_can_fetch:
-                interval_minutes = settings.upwork_auto_fetch_interval or 2
-                should_fetch = False
-                
-                if settings.upwork_last_auto_fetch is None:
-                    should_fetch = True
-                else:
-                    time_since_last = (now - settings.upwork_last_auto_fetch).total_seconds() / 60
-                    if time_since_last >= interval_minutes:
-                        should_fetch = True
-                
-                if should_fetch:
-                    # Trigger fetch in background
-                    import asyncio
-                    asyncio.create_task(trigger_upwork_fetch(user.email, user.id, settings, db))
-            
-            # Check Freelancer auto-fetch
-            if settings.freelancer_auto_fetch and freelancer_can_fetch:
-                interval_minutes = settings.freelancer_auto_fetch_interval or 3
-                should_fetch = False
-                
-                if settings.freelancer_last_auto_fetch is None:
-                    should_fetch = True
-                else:
-                    time_since_last = (now - settings.freelancer_last_auto_fetch).total_seconds() / 60
-                    if time_since_last >= interval_minutes:
-                        should_fetch = True
-                
-                if should_fetch:
-                    # Trigger fetch in background
-                    import asyncio
-                    asyncio.create_task(trigger_freelancer_fetch(user.email, user.id, settings, db))
         
         return {
             "upwork": {
@@ -759,61 +742,38 @@ async def get_fetch_limits(email: str = Depends(verify_token), db: Session = Dep
             "freelancer_plus": {"fetch_count": 0, "daily_limit": 5, "remaining": 5, "can_fetch": True}
         }
 
-async def trigger_upwork_fetch(email: str, user_id: int, settings, db: Session):
-    """Trigger Upwork fetch in background"""
-    try:
-        from models import User
-        UPWORK_WEBHOOK_URL = os.getenv('UPWORK_WEBHOOK_URL')
-        if not UPWORK_WEBHOOK_URL:
-            return
-        
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(UPWORK_WEBHOOK_URL, json={"user_email": email})
-            
-            if response.status_code == 200:
-                # Update last fetch time and count
-                user = db.query(User).filter(User.id == user_id).first()
-                if user:
-                    settings.upwork_last_auto_fetch = datetime.utcnow()
-                    user.upwork_fetch_count = (user.upwork_fetch_count or 0) + 1
-                    db.commit()
-                    print(f"[Auto-Fetch] Upwork triggered for {email}")
-    except Exception as e:
-        print(f"[Auto-Fetch] Upwork error: {e}")
 
-async def trigger_freelancer_fetch(email: str, user_id: int, settings, db: Session):
-    """Trigger Freelancer fetch in background"""
-    try:
-        from models import User
-        FREELANCER_WEBHOOK_URL = os.getenv('FREELANCER_WEBHOOK_URL')
-        if not FREELANCER_WEBHOOK_URL:
-            return
-        
-        async with httpx.AsyncClient(timeout=60.0) as client:
-            response = await client.post(FREELANCER_WEBHOOK_URL, json={"user_email": email})
-            
-            if response.status_code == 200:
-                # Update last fetch time and count
-                user = db.query(User).filter(User.id == user_id).first()
-                if user:
-                    settings.freelancer_last_auto_fetch = datetime.utcnow()
-                    user.freelancer_fetch_count = (user.freelancer_fetch_count or 0) + 1
-                    db.commit()
-                    print(f"[Auto-Fetch] Freelancer triggered for {email}")
-    except Exception as e:
-        print(f"[Auto-Fetch] Freelancer error: {e}")
 
 @app.get("/api/leads")
-async def get_leads(email: str = Depends(verify_token), db: Session = Depends(get_db)):
+async def get_leads(
+    page: int = Query(1, ge=1, description="Page number"),
+    limit: int = Query(50, ge=1, le=100, description="Items per page"),
+    platform: Optional[str] = Query(None, description="Filter by platform"),
+    status: Optional[str] = Query(None, description="Filter by status"),
+    email: str = Depends(verify_token), 
+    db: Session = Depends(get_db)
+):
     try:
         if db is None:
-            return {"leads": []}
+            return {"leads": [], "total": 0, "page": page, "limit": limit}
         
         from models import Lead
         user = get_user_by_email(email, db)
         
-        # Get only this user's visible leads
-        leads = db.query(Lead).filter(Lead.user_id == user.id, Lead.visible == True).order_by(Lead.updated_at.desc()).all()
+        # Build query with filters
+        query = db.query(Lead).filter(Lead.user_id == user.id, Lead.visible == True)
+        
+        if platform:
+            query = query.filter(Lead.platform == platform)
+        if status:
+            query = query.filter(Lead.status == status)
+        
+        # Get total count for pagination
+        total = query.count()
+        
+        # Apply pagination and ordering
+        offset = (page - 1) * limit
+        leads = query.order_by(Lead.updated_at.desc()).offset(offset).limit(limit).all()
         
         return {
             "leads": [
@@ -836,13 +796,17 @@ async def get_leads(email: str = Depends(verify_token), db: Session = Depends(ge
                     "updated_at": lead.updated_at.isoformat() if lead.updated_at else None
                 }
                 for lead in leads
-            ]
+            ],
+            "total": total,
+            "page": page,
+            "limit": limit,
+            "pages": (total + limit - 1) // limit
         }
     except Exception as e:
         print(f"❌ Error fetching leads: {e}")
         import traceback
         traceback.print_exc()
-        return {"leads": []}
+        return {"leads": [], "total": 0, "page": page, "limit": limit}
 
 @app.get("/api/dashboard/pipeline")
 async def get_pipeline_stats(email: str = Depends(verify_token), db: Session = Depends(get_db)):
@@ -920,6 +884,82 @@ async def get_pipeline_stats(email: str = Depends(verify_token), db: Session = D
         traceback.print_exc()
         return {"pipeline": []}
 
+@lru_cache(maxsize=100)
+def get_dashboard_stats_cached(user_id: int, cache_key: str):
+    """Cached dashboard stats - cache_key includes timestamp for cache invalidation"""
+    from database import SessionLocal
+    from models import Lead
+    
+    db = SessionLocal()
+    try:
+        # Use optimized queries with database aggregation
+        base_query = db.query(Lead).filter(Lead.user_id == user_id, Lead.visible == True)
+        
+        # Get counts using database aggregation
+        total_leads = base_query.count()
+        ai_drafted = base_query.filter(Lead.status == "AI Drafted").count()
+        approved = base_query.filter(Lead.proposal_accepted == True).count()
+        
+        # Get low score count with database query
+        low_score = base_query.filter(
+            Lead.score.notin_(['—', '', None]),
+            func.cast(Lead.score, Float) < 7
+        ).count()
+        
+        # Platform distribution using database aggregation
+        platform_stats = db.query(
+            Lead.platform,
+            func.count(Lead.id).label('count')
+        ).filter(
+            Lead.user_id == user_id,
+            Lead.visible == True
+        ).group_by(Lead.platform).all()
+        
+        total_with_platform = sum(stat.count for stat in platform_stats)
+        platform_distribution = [
+            {
+                "name": stat.platform or "Unknown",
+                "value": round((stat.count / total_with_platform * 100), 1) if total_with_platform > 0 else 0,
+                "count": stat.count
+            }
+            for stat in platform_stats
+        ]
+        
+        # Timeline data (last 30 days) using database aggregation
+        thirty_days_ago = datetime.utcnow() - timedelta(days=30)
+        timeline_stats = db.query(
+            func.date(Lead.created_at).label('date'),
+            func.count(Lead.id).label('total'),
+            func.sum(func.case([(Lead.status.in_(["AI Drafted", "Approved"]), 1)], else_=0)).label('proposals')
+        ).filter(
+            Lead.user_id == user_id,
+            Lead.visible == True,
+            Lead.created_at >= thirty_days_ago
+        ).group_by(func.date(Lead.created_at)).order_by(func.date(Lead.created_at)).all()
+        
+        timeline_data = [
+            {
+                "date": stat.date.strftime("%b %d") if stat.date else "Unknown",
+                "total": int(stat.total),
+                "proposals": int(stat.proposals or 0)
+            }
+            for stat in timeline_stats
+        ]
+        
+        if not timeline_data:
+            timeline_data = [{"date": datetime.utcnow().strftime("%b %d"), "total": 0, "proposals": 0}]
+        
+        return {
+            "total_leads": total_leads,
+            "ai_drafted": ai_drafted,
+            "low_score": low_score,
+            "approved": approved,
+            "platform_distribution": platform_distribution,
+            "timeline_data": timeline_data
+        }
+    finally:
+        db.close()
+
 @app.get("/api/dashboard/stats")
 async def get_dashboard_stats(email: str = Depends(verify_token), db: Session = Depends(get_db)):
     try:
@@ -933,80 +973,15 @@ async def get_dashboard_stats(email: str = Depends(verify_token), db: Session = 
                 "timeline_data": []
             }
         
-        from models import Lead
-        from datetime import datetime, timedelta
         user = get_user_by_email(email, db)
         
-        # Get only this user's leads
-        all_leads = db.query(Lead).filter(Lead.user_id == user.id).all()
-        total_leads = len(all_leads)
+        # Create cache key with 5-minute granularity for cache invalidation
+        cache_timestamp = int(datetime.utcnow().timestamp() // 300)  # 5-minute buckets
+        cache_key = f"{user.id}_{cache_timestamp}"
         
-        # Count by status
-        ai_drafted = len([l for l in all_leads if l.status == "AI Drafted"])
-        # Count approved using the new proposal_accepted field
-        approved = len([l for l in all_leads if getattr(l, 'proposal_accepted', False) == True])
+        # Use cached function
+        return get_dashboard_stats_cached(user.id, cache_key)
         
-        # Count Unqualified leads (score < 7 or score is "—")
-        low_score = 0
-        for lead in all_leads:
-            try:
-                score_val = lead.score.strip() if lead.score else "—"
-                if score_val == "—" or score_val == "":
-                    continue
-                if float(score_val) < 7:
-                    low_score += 1
-            except (ValueError, AttributeError):
-                continue
-        
-        # Platform distribution
-        platform_counts = {}
-        for lead in all_leads:
-            platform = lead.platform or "Unknown"
-            platform_counts[platform] = platform_counts.get(platform, 0) + 1
-        
-        total_with_platform = sum(platform_counts.values())
-        platform_distribution = [
-            {
-                "name": platform,
-                "value": round((count / total_with_platform * 100), 1) if total_with_platform > 0 else 0,
-                "count": count
-            }
-            for platform, count in platform_counts.items()
-        ]
-        
-        # Timeline data (last 30 days)
-        thirty_days_ago = datetime.utcnow() - timedelta(days=30)
-        recent_leads = [l for l in all_leads if l.created_at and l.created_at >= thirty_days_ago]
-        
-        # Group by date
-        date_groups = {}
-        for lead in recent_leads:
-            date_key = lead.created_at.strftime("%b %d")
-            if date_key not in date_groups:
-                date_groups[date_key] = {"total": 0, "proposals": 0}
-            date_groups[date_key]["total"] += 1
-            # Count proposals sent (AI Drafted or Approved status)
-            if lead.status in ["AI Drafted", "Approved"]:
-                date_groups[date_key]["proposals"] += 1
-        
-        # Convert to list and sort
-        timeline_data = [
-            {"date": date, "total": data["total"], "proposals": data["proposals"]}
-            for date, data in sorted(date_groups.items(), key=lambda x: datetime.strptime(x[0], "%b %d"))
-        ]
-        
-        # If no data, provide sample structure
-        if not timeline_data:
-            timeline_data = [{"date": datetime.utcnow().strftime("%b %d"), "total": 0, "proposals": 0}]
-        
-        return {
-            "total_leads": total_leads,
-            "ai_drafted": ai_drafted,
-            "low_score": low_score,
-            "approved": approved,
-            "platform_distribution": platform_distribution,
-            "timeline_data": timeline_data
-        }
     except Exception as e:
         print(f"Error fetching dashboard stats: {e}")
         import traceback
@@ -1404,22 +1379,29 @@ async def get_current_user(email: str = Depends(verify_token), db: Session = Dep
 
 @app.get("/")
 async def root():
-    return {"message": "FastAPI Proxy Server with PostgreSQL"}
+    """Fast root endpoint with minimal processing"""
+    return {"status": "ok", "service": "akbpo-api", "version": "1.0"}
 
+
+@cached(ttl=30, key_prefix="health_")  # Cache for 30 seconds
+def _check_db_status():
+    """Cached database status check optimized for transaction pooler"""
+    try:
+        from db_utils import quick_db_check
+        if quick_db_check():
+            return "connected"
+        else:
+            return "disconnected"
+    except Exception as e:
+        return f"error: {str(e)[:50]}"
 
 @app.get("/api/health")
 async def health_check():
-    db_status = "disconnected"
-    try:
-        from database import engine
-        with engine.connect() as conn:
-            db_status = "connected"
-    except Exception as e:
-        db_status = f"error: {str(e)[:100]}"
-    
+    """Fast health check with caching"""
     return {
         "status": "running",
-        "database": db_status
+        "database": _check_db_status(),
+        "timestamp": int(time.time())
     }
 
 @app.get("/api/n8n/settings/{user_id}")
@@ -1483,12 +1465,8 @@ async def get_settings(email: str = Depends(verify_token), db: Session = Depends
             upwork_job_categories=["Web Development"],
             upwork_max_jobs=3,
             upwork_payment_verified=False,
-            upwork_auto_fetch=False,
-            upwork_auto_fetch_interval=2,
             freelancer_job_category="Web Development",
-            freelancer_max_jobs=3,
-            freelancer_auto_fetch=False,
-            freelancer_auto_fetch_interval=3
+            freelancer_max_jobs=3
         )
         db.add(settings)
         db.commit()
@@ -1521,18 +1499,10 @@ async def update_settings(
         settings.upwork_max_jobs = settings_data.upwork_max_jobs
     if settings_data.upwork_payment_verified is not None:
         settings.upwork_payment_verified = settings_data.upwork_payment_verified
-    if settings_data.upwork_auto_fetch is not None:
-        settings.upwork_auto_fetch = settings_data.upwork_auto_fetch
-    if settings_data.upwork_auto_fetch_interval is not None:
-        settings.upwork_auto_fetch_interval = settings_data.upwork_auto_fetch_interval
     if settings_data.freelancer_job_category is not None:
         settings.freelancer_job_category = settings_data.freelancer_job_category
     if settings_data.freelancer_max_jobs is not None:
         settings.freelancer_max_jobs = settings_data.freelancer_max_jobs
-    if settings_data.freelancer_auto_fetch is not None:
-        settings.freelancer_auto_fetch = settings_data.freelancer_auto_fetch
-    if settings_data.freelancer_auto_fetch_interval is not None:
-        settings.freelancer_auto_fetch_interval = settings_data.freelancer_auto_fetch_interval
     if settings_data.ai_agent_min_score is not None:
         settings.ai_agent_min_score = settings_data.ai_agent_min_score
     if settings_data.ai_agent_max_score is not None:
@@ -2467,3 +2437,2147 @@ async def delete_talent(
         if db:
             db.rollback()
         raise HTTPException(status_code=500, detail="Failed to delete talent")
+
+# Freelancer Extension API Endpoints
+from pydantic import BaseModel
+from typing import Optional
+
+class BidRequest(BaseModel):
+    access_token: str
+    project_id: int
+    bidder_id: int
+    amount: float
+    period: int = 7
+    description: str
+    milestone_percentage: int = 100
+    freelancer_cookies: Optional[str] = None
+
+class ProjectsRequest(BaseModel):
+    access_token: str
+    limit: int = 20
+    freelancer_cookies: Optional[str] = None
+
+class MessageRequest(BaseModel):
+    thread_id: int
+    message: str
+    access_token: str
+    freelancer_cookies: Optional[str] = None
+
+@app.get("/api/freelancer/test")
+async def test_freelancer():
+    """Test if we can reach Freelancer API"""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "https://www.freelancer.com/api/projects/0.1/projects/active/?limit=1",
+                timeout=10.0
+            )
+            return {
+                "success": True,
+                "status_code": response.status_code,
+                "message": "Can reach Freelancer API"
+            }
+    except Exception as e:
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
+@app.get("/api/freelancer/debug")
+async def debug_freelancer_credentials(
+    email: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    """Debug endpoint to check freelancer credentials for current user"""
+    try:
+        from models import User, FreelancerCredentials
+        
+        # Get user
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            return {"error": "User not found", "user_email": email}
+        
+        # Get credentials
+        credentials = db.query(FreelancerCredentials).filter(
+            FreelancerCredentials.user_id == user.id
+        ).first()
+        
+        if not credentials:
+            return {
+                "user_email": email,
+                "user_id": user.id,
+                "has_credentials": False,
+                "message": "No freelancer credentials found for this user"
+            }
+        
+        return {
+            "user_email": email,
+            "user_id": user.id,
+            "has_credentials": True,
+            "credentials": {
+                "id": credentials.id,
+                "user_id": credentials.user_id,
+                "freelancer_user_id": credentials.freelancer_user_id,
+                "validated_username": credentials.validated_username,
+                "validated_email": credentials.validated_email,
+                "is_validated": credentials.is_validated,
+                "has_access_token": bool(credentials.access_token),
+                "has_csrf_token": bool(credentials.csrf_token),
+                "has_auth_hash": bool(credentials.auth_hash),
+                "has_cookies": bool(credentials.cookies),
+                "created_at": credentials.created_at.isoformat() if credentials.created_at else None,
+                "updated_at": credentials.updated_at.isoformat() if credentials.updated_at else None,
+                "last_validated": credentials.last_validated.isoformat() if credentials.last_validated else None
+            }
+        }
+        
+    except Exception as e:
+        return {
+            "error": str(e),
+            "user_email": email
+        }
+
+@app.post("/api/bid/place")
+async def place_bid(bid: BidRequest):
+    """Place a bid on a Freelancer project"""
+    try:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            
+            print(f"Attempting bid on project {bid.project_id}...")
+            
+            # Prepare headers - mimic browser request exactly
+            headers = {
+                "Content-Type": "application/json",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Accept-Encoding": "gzip, deflate, br",
+                "Origin": "https://www.freelancer.com",
+                "Referer": f"https://www.freelancer.com/projects/{bid.project_id}",
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin",
+                "Sec-Ch-Ua": '"Not_A Brand";v="8", "Chromium";v="120", "Google Chrome";v="120"',
+                "Sec-Ch-Ua-Mobile": "?0",
+                "Sec-Ch-Ua-Platform": '"Windows"',
+            }
+            
+            # Use OAuth token if available
+            if bid.access_token and bid.access_token != 'using_cookies':
+                print("Using OAuth token for authentication")
+                headers["Authorization"] = f"Bearer {bid.access_token}"
+                headers["freelancer-oauth-v1"] = bid.access_token
+            else:
+                print("Using cookie-based authentication (No OAuth token provided)")
+            
+            # Parse ALL cookies from the JSON cookie string
+            cookies_dict = {}
+            csrf_token = None
+            user_id = None
+            auth_hash = None
+            
+            if bid.freelancer_cookies:
+                try:
+                    # Parse JSON cookie object
+                    cookie_data = json.loads(bid.freelancer_cookies)
+                    
+                    user_id = cookie_data.get('GETAFREE_USER_ID')
+                    auth_hash = cookie_data.get('GETAFREE_AUTH_HASH_V2')
+                    csrf_token = cookie_data.get('XSRF_TOKEN')
+                    session2 = cookie_data.get('session2', '')
+                    qfence = cookie_data.get('qfence', '')
+                    cookieconsent_status = cookie_data.get('cookieconsent_status', '')
+                    
+                    # MANDATORY: Check all required cookies exist
+                    if not user_id or not auth_hash:
+                        return {
+                            "success": False,
+                            "error": "Missing required cookies (GETAFREE_USER_ID or GETAFREE_AUTH_HASH_V2). Please extract credentials again.",
+                            "status_code": 400
+                        }
+                    
+                    if not session2:
+                        return {
+                            "success": False,
+                            "error": "session2 cookie missing - this is required for bidding. Please log out and log back into Freelancer.com, then extract credentials again.",
+                            "status_code": 400
+                        }
+                    
+                    # Make CSRF token optional - try bidding without it if missing
+                    if not csrf_token:
+                        print("Warning: XSRF-TOKEN cookie missing - will attempt bidding without CSRF protection")
+                        csrf_token = ""  # Set empty string to avoid None errors
+                    
+                    # Set ALL required cookies
+                    cookies_dict['GETAFREE_USER_ID'] = user_id
+                    cookies_dict['GETAFREE_AUTH_HASH_V2'] = auth_hash
+                    if csrf_token:
+                        cookies_dict['XSRF-TOKEN'] = csrf_token
+                    cookies_dict['session2'] = session2
+                    
+                    if qfence:
+                        cookies_dict['qfence'] = qfence
+                    
+                    if cookieconsent_status:
+                        cookies_dict['cookieconsent_status'] = cookieconsent_status
+                    
+                    # Add CSRF headers only if token is available
+                    if csrf_token:
+                        headers["X-CSRF-Token"] = csrf_token
+                        headers["X-XSRF-TOKEN"] = csrf_token
+                        headers["x-csrf-token"] = csrf_token
+                        headers["x-xsrf-token"] = csrf_token
+                        print(f"  All CSRF headers set with token: {csrf_token[:20]}...")
+                    else:
+                        print("  No CSRF token available - proceeding without CSRF headers")
+                    headers["x-requested-with"] = "XMLHttpRequest"
+                    headers["freelancer-auth-v2"] = f"{user_id};{auth_hash}"
+                    headers["sec-ch-ua-platform"] = '"Windows"'
+                    
+                    print(f"Using Freelancer session cookies:")
+                    print(f"  GETAFREE_USER_ID: {user_id}")
+                    print(f"  GETAFREE_AUTH_HASH_V2: {auth_hash[:30]}...")
+                    print(f"  XSRF-TOKEN: {csrf_token[:20] if csrf_token else 'Not provided'}...")
+                    print(f"  session2: {'Present' if session2 else 'MISSING (REQUIRED)'}")
+                    print(f"  qfence: {'Present' if qfence else 'Missing'}")
+                    print(f"  cookieconsent_status: {'Present' if cookieconsent_status else 'Missing'}")
+                    print(f"  freelancer-auth-v2: {user_id};{auth_hash[:20]}...")
+                    print(f"  x-requested-with: XMLHttpRequest")
+                    print(f"  All CSRF headers: X-CSRF-Token, X-XSRF-TOKEN, x-csrf-token, x-xsrf-token")
+                        
+                except json.JSONDecodeError as e:
+                    print(f"Error parsing cookie JSON: {e}")
+                    return {
+                        "success": False,
+                        "error": "Invalid cookie format. Please extract credentials again.",
+                        "status_code": 400
+                    }
+            else:
+                if not headers.get("Authorization"):
+                    print("Error: No Freelancer cookies provided and no Access Token")
+                    return {
+                        "success": False,
+                        "error": "No authentication credentials. Please extract credentials from Token tab.",
+                        "status_code": 401
+                    }
+                else:
+                    print("Warning: No Freelancer cookies provided, relying on Access Token")
+            
+            # Verify we have credentials (either cookies or token)
+            if not cookies_dict and not headers.get("Authorization"):
+                return {
+                    "success": False,
+                    "error": "No authentication credentials provided. Please extract credentials first.",
+                    "status_code": 401
+                }
+            
+            # CRITICAL: Ensure bidder_id matches the authenticated user
+            if user_id and str(bid.bidder_id) != str(user_id):
+                return {
+                    "success": False,
+                    "error": f"Bidder ID mismatch: bidder_id ({bid.bidder_id}) must match GETAFREE_USER_ID ({user_id}). Please use the correct user ID.",
+                    "status_code": 400
+                }
+            
+            # Use the exact endpoint that Freelancer's frontend uses with query parameters
+            api_url = "https://www.freelancer.com/api/projects/0.1/bids/?compact=true&new_errors=true&new_pools=true"
+            
+            # Prepare JSON payload exactly as Freelancer frontend does
+            payload = {
+                "project_id": bid.project_id,
+                "bidder_id": bid.bidder_id,
+                "amount": bid.amount,
+                "period": bid.period,
+                "milestone_percentage": bid.milestone_percentage,
+                "highlighted": False,
+                "sponsored": False,
+                "ip_contract": False,
+                "anonymous": False,
+                "description": bid.description
+            }
+            
+            # Use JSON content type as Freelancer frontend does
+            headers["Content-Type"] = "application/json"
+            
+            print(f"Attempting API endpoint: {api_url}")
+            print(f"JSON payload: {payload}")
+            print(f"Cookies: {list(cookies_dict.keys())}")
+            print(f"CSRF headers: X-CSRF-TOKEN = {headers.get('X-CSRF-TOKEN', 'Not set')[:20]}...")
+            
+            response = await client.post(
+                api_url,
+                headers=headers,
+                cookies=cookies_dict,
+                json=payload,
+                timeout=30.0
+            )
+            
+            print(f"Response status: {response.status_code}")
+            print(f"Response headers: {dict(response.headers)}")
+            response_text = response.text
+            print(f"Response body: {response_text[:1000]}")
+            
+            # Log full response for debugging
+            if response.status_code != 200 and response.status_code != 201:
+                print(f"FULL ERROR RESPONSE: {response_text}")
+            
+            if response.status_code == 200 or response.status_code == 201:
+                try:
+                    response_data = response.json()
+                    print(f"Success! Bid placed: {response_data}")
+                    return {
+                        "success": True,
+                        "data": response_data,
+                        "message": f"Bid placed successfully: ${bid.amount}"
+                    }
+                except Exception as e:
+                    print(f"Error parsing response: {e}")
+                    return {
+                        "success": True,
+                        "message": f"Bid placed (status {response.status_code})"
+                    }
+            else:
+                error_text = response.text
+                print(f"Bid failed with status {response.status_code}")
+                print(f"Error details: {error_text}")
+                
+                # Parse error message
+                try:
+                    error_json = response.json()
+                    error_msg = error_json.get('message', error_text)
+                except:
+                    error_msg = error_text
+                
+                return {
+                    "success": False,
+                    "error": error_msg,
+                    "status_code": response.status_code,
+                    "full_response": error_text[:500]
+                }
+                
+    except Exception as e:
+        print(f"Exception: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/projects/list")
+async def list_projects(request: ProjectsRequest):
+    """Get list of active projects based on user skills"""
+    try:
+        async with httpx.AsyncClient() as client:
+            # First get user's skills
+            user_skills = []
+            try:
+                user_response = await client.get(
+                    "https://www.freelancer.com/api/users/0.1/self?limit=1&jobs=true&webapp=1&compact=true&new_errors=true&new_pools=true",
+                    headers={
+                        "Authorization": f"Bearer {request.access_token}",
+                        "freelancer-oauth-v1": request.access_token,
+                    },
+                    timeout=30.0
+                )
+                
+                if user_response.status_code == 200:
+                    user_data = user_response.json()
+                    user = user_data.get('result', {})
+                    
+                    # Extract skill IDs from user profile
+                    if user.get('jobs'):
+                        user_skills = [job['id'] for job in user['jobs']]
+                        print(f"Found user skills: {user_skills}")
+                        
+            except Exception as e:
+                print(f"Could not get user skills: {e}")
+            
+            # Build search URL with user's skills using the API endpoint (repeat jobs[] for each ID)
+            if user_skills:
+                skills_params = '&'.join([f'jobs[]={skill_id}' for skill_id in user_skills])
+                search_url = f"https://www.freelancer.com/api/projects/0.1/projects/active/?compact=true&limit={request.limit}&user_details=true&{skills_params}&languages[]=en"
+                print(f"Searching projects with skills: {user_skills}")
+                print(f"API Search URL: {search_url}")
+                print(f"Equivalent web URL: https://www.freelancer.com/search/projects?projectSkills={','.join(map(str, user_skills))}&projectLanguages=en")
+            else:
+                search_url = f"https://www.freelancer.com/api/projects/0.1/projects/active/?compact=true&limit={request.limit}&user_details=true&user_recommended=true"
+                print("Using recommended projects (no skills found)")
+            
+            # Fetch projects
+            response = await client.get(
+                search_url,
+                headers={
+                    "Authorization": f"Bearer {request.access_token}",
+                    "freelancer-oauth-v1": request.access_token,
+                },
+                timeout=30.0
+            )
+            
+            if response.status_code == 200:
+                return {
+                    "success": True,
+                    "data": response.json(),
+                    "user_skills": user_skills,
+                    "search_url": search_url
+                }
+            else:
+                return {
+                    "success": False,
+                    "error": response.text,
+                    "status_code": response.status_code
+                }
+                
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/user/info")
+async def get_user_info(request: ProjectsRequest):
+    """Get user information and check token scopes"""
+    try:
+        async with httpx.AsyncClient() as client:
+            response = await client.get(
+                "https://www.freelancer.com/api/users/0.1/self/",
+                headers={
+                    "Authorization": f"Bearer {request.access_token}",
+                    "freelancer-oauth-v1": request.access_token,
+                },
+                timeout=30.0
+            )
+            
+            if response.status_code == 200:
+                data = response.json()
+                return {
+                    "success": True,
+                    "data": data,
+                    "message": "Token is valid"
+                }
+            else:
+                error_data = response.text
+                # Check if it's a scope issue
+                if "insufficient_scope" in error_data or response.status_code == 403:
+                    return {
+                        "success": False,
+                        "error": "Token does not have required scopes for bidding",
+                        "status_code": response.status_code,
+                        "message": "You need to get a token with bid:write permissions. See the OAuth flow documentation."
+                    }
+                return {
+                    "success": False,
+                    "error": error_data,
+                    "status_code": response.status_code
+                }
+                
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/token/check-scopes")
+async def check_token_scopes(request: ProjectsRequest):
+    """Check if token has bidding permissions"""
+    try:
+        async with httpx.AsyncClient() as client:
+            # Try to access a bid-related endpoint to check permissions
+            response = await client.get(
+                "https://www.freelancer.com/api/users/0.1/self/",
+                headers={
+                    "Authorization": f"Bearer {request.access_token}",
+                    "freelancer-oauth-v1": request.access_token,
+                },
+                timeout=30.0
+            )
+            
+            if response.status_code == 200:
+                return {
+                    "success": True,
+                    "message": "Token is valid for basic operations",
+                    "warning": "Cannot verify bid:write scope without attempting a bid. Token may still lack bidding permissions."
+                }
+            elif response.status_code == 403:
+                return {
+                    "success": False,
+                    "error": "Token has insufficient scopes",
+                    "message": "You need to obtain a token with bid:write, project:read, and user:read scopes"
+                }
+            else:
+                return {
+                    "success": False,
+                    "error": response.text,
+                    "status_code": response.status_code
+                }
+                
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+@app.post("/api/message/send")
+async def send_message(msg: MessageRequest):
+    """Send a message in a Freelancer thread"""
+    try:
+        async with httpx.AsyncClient(follow_redirects=True) as client:
+            
+            print(f"Sending message to thread {msg.thread_id}...")
+            
+            # Prepare headers
+            headers = {
+                "Content-Type": "application/x-www-form-urlencoded",
+                "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+                "Accept": "application/json, text/plain, */*",
+                "Accept-Language": "en-US,en;q=0.9",
+                "Origin": "https://www.freelancer.com",
+                "Referer": f"https://www.freelancer.com/messages/{msg.thread_id}",
+                "Sec-Fetch-Dest": "empty",
+                "Sec-Fetch-Mode": "cors",
+                "Sec-Fetch-Site": "same-origin",
+            }
+            
+            # Add OAuth header if token looks valid
+            if msg.access_token and len(msg.access_token) > 50 and msg.access_token != 'using_cookies':
+                headers["Authorization"] = f"Bearer {msg.access_token}"
+                headers["freelancer-oauth-v1"] = msg.access_token
+            
+            # Add Freelancer session cookies if provided
+            cookies_dict = {}
+            if msg.freelancer_cookies:
+                try:
+                    # Parse JSON cookie object
+                    cookie_data = json.loads(msg.freelancer_cookies)
+                    
+                    user_id = cookie_data.get('GETAFREE_USER_ID')
+                    auth_hash = cookie_data.get('GETAFREE_AUTH_HASH_V2')
+                    csrf_token = cookie_data.get('XSRF_TOKEN')
+                    
+                    if user_id and auth_hash:
+                        cookies_dict['GETAFREE_USER_ID'] = user_id
+                        cookies_dict['GETAFREE_AUTH_HASH_V2'] = auth_hash
+                        if csrf_token:
+                            cookies_dict['XSRF-TOKEN'] = csrf_token
+                        print(f"Using Freelancer session cookies")
+                except json.JSONDecodeError:
+                    # Fallback to old format
+                    parts = msg.freelancer_cookies.split(';')
+                    if len(parts) >= 2:
+                        cookies_dict['GETAFREE_USER_ID'] = unquote(parts[0])
+                        cookies_dict['GETAFREE_AUTH_HASH_V2'] = unquote(parts[1])
+                        print(f"Using Freelancer session cookies (legacy format)")
+            
+            # Send message
+            url = f"https://www.freelancer.com/api/messages/0.1/threads/{msg.thread_id}/messages"
+            
+            response = await client.post(
+                url,
+                headers=headers,
+                cookies=cookies_dict if cookies_dict else None,
+                data={
+                    "message": msg.message,
+                    "source": "chat_box"
+                },
+                timeout=30.0
+            )
+            
+            print(f"Response status: {response.status_code}")
+            print(f"Response body: {response.text[:500]}")
+            
+            if response.status_code == 200 or response.status_code == 201:
+                return {
+                    "success": True,
+                    "data": response.json(),
+                    "message": "Message sent successfully"
+                }
+            else:
+                error_text = response.text
+                return {
+                    "success": False,
+                    "error": error_text,
+                    "status_code": response.status_code
+                }
+                
+    except Exception as e:
+        print(f"Exception: {str(e)}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+# Freelancer Credentials endpoints
+@app.post("/api/freelancer/credentials", response_model=FreelancerCredentialsResponse)
+async def save_freelancer_credentials(
+    credentials: FreelancerCredentialsCreate,
+    email: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    """Save or update Freelancer credentials for the authenticated user"""
+    if db is None:
+        raise HTTPException(status_code=500, detail="Load On server Plz try again Later")
+    
+    try:
+        from models import User, FreelancerCredentials
+        from datetime import datetime
+        
+        # Get user
+        print(f"🔍 [SAVE_CREDS] Looking for user with email: {email}")
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            print(f"❌ [SAVE_CREDS] User not found with email: {email}")
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        print(f"✅ [SAVE_CREDS] Found user: ID={user.id}, Email={user.email}")
+        
+        # Check if credentials already exist
+        existing_creds = db.query(FreelancerCredentials).filter(
+            FreelancerCredentials.user_id == user.id
+        ).first()
+        
+        if existing_creds:
+            print(f"📝 [SAVE_CREDS] Updating existing credentials for user {user.id}")
+        else:
+            print(f"🆕 [SAVE_CREDS] Creating new credentials for user {user.id}")
+        
+        if existing_creds:
+            # Update existing credentials
+            if credentials.access_token is not None:
+                existing_creds.access_token = credentials.access_token
+            if credentials.csrf_token is not None:
+                existing_creds.csrf_token = credentials.csrf_token
+            if credentials.freelancer_user_id is not None:
+                existing_creds.freelancer_user_id = str(credentials.freelancer_user_id)
+            if credentials.auth_hash is not None:
+                existing_creds.auth_hash = credentials.auth_hash
+            if credentials.cookies is not None:
+                existing_creds.cookies = credentials.cookies
+            if credentials.validated_username is not None:
+                existing_creds.validated_username = credentials.validated_username
+            if credentials.validated_email is not None:
+                existing_creds.validated_email = credentials.validated_email
+            
+            # Mark as validated if we have credentials
+            if credentials.access_token or credentials.cookies:
+                existing_creds.is_validated = True
+                existing_creds.last_validated = datetime.utcnow()
+            
+            existing_creds.updated_at = datetime.utcnow()
+            
+            db.commit()
+            db.refresh(existing_creds)
+            return existing_creds
+        else:
+            # Create new credentials
+            new_creds = FreelancerCredentials(
+                user_id=user.id,
+                access_token=credentials.access_token,
+                csrf_token=credentials.csrf_token,
+                freelancer_user_id=str(credentials.freelancer_user_id) if credentials.freelancer_user_id is not None else None,
+                auth_hash=credentials.auth_hash,
+                cookies=credentials.cookies,
+                validated_username=credentials.validated_username,
+                validated_email=credentials.validated_email,
+                is_validated=bool(credentials.access_token or credentials.cookies),
+                last_validated=datetime.utcnow() if (credentials.access_token or credentials.cookies) else None
+            )
+            
+            db.add(new_creds)
+            db.commit()
+            db.refresh(new_creds)
+            return new_creds
+            
+    except Exception as e:
+        print(f"Error saving Freelancer credentials: {e}")
+        raise HTTPException(status_code=500, detail="Load On server Plz try again Later")
+
+@app.get("/api/freelancer/credentials", response_model=FreelancerCredentialsResponse)
+async def get_freelancer_credentials(
+    email: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    """Get Freelancer credentials for the authenticated user"""
+    if db is None:
+        raise HTTPException(status_code=500, detail="Load On server Plz try again Later")
+    
+    try:
+        from models import User, FreelancerCredentials
+        
+        # Get user
+        print(f"🔍 [GET_CREDS] Looking for user with email: {email}")
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            print(f"❌ [GET_CREDS] User not found with email: {email}")
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        print(f"✅ [GET_CREDS] Found user: ID={user.id}, Email={user.email}")
+        
+        # Get credentials
+        credentials = db.query(FreelancerCredentials).filter(
+            FreelancerCredentials.user_id == user.id
+        ).first()
+        
+        if credentials:
+            print(f"📋 [GET_CREDS] Found credentials for user {user.id}: freelancer_user_id={credentials.freelancer_user_id}")
+        else:
+            print(f"❌ [GET_CREDS] No credentials found for user {user.id}")
+        
+        if not credentials:
+            raise HTTPException(status_code=404, detail="No Freelancer credentials found")
+        
+        return credentials
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error getting Freelancer credentials: {e}")
+        raise HTTPException(status_code=500, detail="Load On server Plz try again Later")
+
+@app.put("/api/freelancer/credentials", response_model=FreelancerCredentialsResponse)
+async def update_freelancer_credentials(
+    credentials: FreelancerCredentialsUpdate,
+    email: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    """Update Freelancer credentials for the authenticated user"""
+    if db is None:
+        raise HTTPException(status_code=500, detail="Load On server Plz try again Later")
+    
+    try:
+        from models import User, FreelancerCredentials
+        from datetime import datetime
+        
+        # Get user
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        # Get existing credentials
+        existing_creds = db.query(FreelancerCredentials).filter(
+            FreelancerCredentials.user_id == user.id
+        ).first()
+        
+        if not existing_creds:
+            raise HTTPException(status_code=404, detail="No Freelancer credentials found")
+        
+        # Update fields
+        if credentials.access_token is not None:
+            existing_creds.access_token = credentials.access_token
+        if credentials.csrf_token is not None:
+            existing_creds.csrf_token = credentials.csrf_token
+        if credentials.freelancer_user_id is not None:
+            existing_creds.freelancer_user_id = str(credentials.freelancer_user_id)
+        if credentials.auth_hash is not None:
+            existing_creds.auth_hash = credentials.auth_hash
+        if credentials.cookies is not None:
+            existing_creds.cookies = credentials.cookies
+        if credentials.is_validated is not None:
+            existing_creds.is_validated = credentials.is_validated
+        if credentials.validated_username is not None:
+            existing_creds.validated_username = credentials.validated_username
+        if credentials.validated_email is not None:
+            existing_creds.validated_email = credentials.validated_email
+        
+        # Update validation timestamp if credentials are being validated
+        if credentials.is_validated:
+            existing_creds.last_validated = datetime.utcnow()
+        
+        existing_creds.updated_at = datetime.utcnow()
+        
+        db.commit()
+        db.refresh(existing_creds)
+        return existing_creds
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error updating Freelancer credentials: {e}")
+        raise HTTPException(status_code=500, detail="Load On server Plz try again Later")
+
+@app.delete("/api/freelancer/credentials")
+async def delete_freelancer_credentials(
+    email: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    """Delete Freelancer credentials for the authenticated user"""
+    if db is None:
+        raise HTTPException(status_code=500, detail="Load On server Plz try again Later")
+    
+    try:
+        from models import User, FreelancerCredentials
+        
+        # Get user
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        # Get and delete credentials
+        credentials = db.query(FreelancerCredentials).filter(
+            FreelancerCredentials.user_id == user.id
+        ).first()
+        
+        if not credentials:
+            raise HTTPException(status_code=404, detail="No Freelancer credentials found")
+        
+        db.delete(credentials)
+        db.commit()
+        
+        return {"message": "Freelancer credentials deleted successfully"}
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error deleting Freelancer credentials: {e}")
+        raise HTTPException(status_code=500, detail="Load On server Plz try again Later")
+
+# Freelancer API endpoints for frontend integration
+@app.get("/api/freelancer/status")
+async def get_freelancer_status(
+    email: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    """Check if user is connected to Freelancer.com - fast version using cached data"""
+    if db is None:
+        return {"connected": False, "error": "Database connection failed"}
+    
+    try:
+        from models import User, FreelancerCredentials
+        from datetime import datetime, timedelta
+        
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            return {"connected": False, "error": "User not found"}
+        
+        # Check if we have FreelancerCredentials in database (from extension)
+        credentials = db.query(FreelancerCredentials).filter(
+            FreelancerCredentials.user_id == user.id
+        ).first()
+        
+        if not credentials:
+            return {"connected": False, "message": "No Freelancer credentials found. Please use the browser extension to connect."}
+        
+        # Fast check - if credentials were validated recently (within 1 hour), trust them
+        if credentials.is_validated and credentials.last_validated:
+            time_since_validation = datetime.utcnow() - credentials.last_validated
+            if time_since_validation < timedelta(hours=1):
+                print(f"✅ Using cached validation for user {user.email} (validated {time_since_validation.total_seconds():.0f}s ago)")
+                
+                user_info = None
+                if credentials.validated_username:
+                    user_info = {
+                        "username": credentials.validated_username,
+                        "id": credentials.freelancer_user_id,
+                        "email": credentials.validated_email,
+                        "display_name": credentials.validated_username
+                    }
+                
+                return {
+                    "connected": True,
+                    "user": user_info,
+                    "credentials": {
+                        "username": credentials.validated_username,
+                        "user_id": credentials.freelancer_user_id,
+                        "updated_at": credentials.updated_at.isoformat() if credentials.updated_at else None,
+                        "access_token": bool(credentials.access_token and credentials.access_token != "using_cookies"),
+                        "cached": True
+                    }
+                }
+        
+        # If not recently validated or not validated at all, do a quick validation
+        if credentials.access_token or credentials.cookies:
+            print(f"🔍 Quick validation for user {user.email}")
+            
+            # Try a very fast API call to validate
+            try:
+                headers = {"Content-Type": "application/json"}
+                cookies = {}
+                
+                # Use cookies if available (faster)
+                if credentials.cookies:
+                    try:
+                        cookie_data = credentials.cookies if isinstance(credentials.cookies, dict) else json.loads(credentials.cookies)
+                        if cookie_data.get("GETAFREE_USER_ID"):
+                            cookies["GETAFREE_USER_ID"] = cookie_data["GETAFREE_USER_ID"]
+                        if cookie_data.get("GETAFREE_AUTH_HASH_V2"):
+                            cookies["GETAFREE_AUTH_HASH_V2"] = cookie_data["GETAFREE_AUTH_HASH_V2"]
+                    except:
+                        pass
+                
+                # Fallback to OAuth
+                if credentials.access_token and credentials.access_token != "using_cookies":
+                    headers["Authorization"] = f"Bearer {credentials.access_token}"
+                    headers["freelancer-oauth-v1"] = credentials.access_token
+                
+                # Very fast validation call
+                async with httpx.AsyncClient(timeout=5.0) as client:
+                    response = await client.get(
+                        "https://www.freelancer.com/api/users/0.1/self?compact=true",
+                        headers=headers,
+                        cookies=cookies
+                    )
+                    
+                    if response.status_code == 200:
+                        data = response.json()
+                        user_data = data.get("result", {})
+                        
+                        # Update validation timestamp
+                        credentials.is_validated = True
+                        credentials.last_validated = datetime.utcnow()
+                        if user_data.get("username"):
+                            credentials.validated_username = user_data["username"]
+                        if user_data.get("id"):
+                            credentials.freelancer_user_id = str(user_data["id"])
+                        db.commit()
+                        
+                        user_info = {
+                            "username": user_data.get("username") or credentials.validated_username,
+                            "id": user_data.get("id") or credentials.freelancer_user_id,
+                            "email": user_data.get("email") or credentials.validated_email,
+                            "display_name": user_data.get("display_name") or user_data.get("username") or credentials.validated_username
+                        }
+                        
+                        print(f"✅ Quick validation successful for user {user.email}")
+                        
+                        return {
+                            "connected": True,
+                            "user": user_info,
+                            "credentials": {
+                                "username": user_info["username"],
+                                "user_id": user_info["id"],
+                                "updated_at": credentials.updated_at.isoformat() if credentials.updated_at else None,
+                                "access_token": bool(credentials.access_token and credentials.access_token != "using_cookies"),
+                                "validated_now": True
+                            }
+                        }
+                    else:
+                        print(f"⚠️ Quick validation failed: {response.status_code}")
+                        
+            except Exception as validation_error:
+                print(f"⚠️ Quick validation error: {validation_error}")
+        
+        return {"connected": False, "message": "Please connect using the browser extension"}
+        
+    except Exception as e:
+        print(f"❌ Error checking Freelancer status: {e}")
+        return {"connected": False, "error": str(e)}
+
+@app.get("/api/freelancer/projects")
+async def get_freelancer_projects(
+    search: str = "",
+    minBudget: str = "",
+    maxBudget: str = "",
+    projectType: str = "all",
+    limit: int = 20,
+    email: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    """Get projects from Freelancer.com using stored credentials - matches extension logic exactly"""
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    
+    try:
+        from models import User, FreelancerCredentials
+        import json
+        
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        credentials = db.query(FreelancerCredentials).filter(
+            FreelancerCredentials.user_id == user.id
+        ).first()
+        
+        if not credentials or not credentials.is_validated:
+            raise HTTPException(status_code=400, detail="Not connected to Freelancer.com")
+        
+        # Prepare headers and cookies for Freelancer API
+        headers = {"Content-Type": "application/json"}
+        cookies = {}
+        
+        # Use cookies if available (faster than OAuth)
+        if credentials.cookies:
+            try:
+                cookie_data = credentials.cookies if isinstance(credentials.cookies, dict) else json.loads(credentials.cookies)
+                
+                # Set up cookies for the request
+                if cookie_data.get("GETAFREE_USER_ID"):
+                    cookies["GETAFREE_USER_ID"] = cookie_data["GETAFREE_USER_ID"]
+                if cookie_data.get("GETAFREE_AUTH_HASH_V2"):
+                    cookies["GETAFREE_AUTH_HASH_V2"] = cookie_data["GETAFREE_AUTH_HASH_V2"]
+                if cookie_data.get("XSRF_TOKEN"):
+                    cookies["XSRF-TOKEN"] = cookie_data["XSRF_TOKEN"]
+                    headers["X-XSRF-TOKEN"] = cookie_data["XSRF_TOKEN"]
+                if cookie_data.get("session2"):
+                    cookies["session2"] = cookie_data["session2"]
+                if cookie_data.get("qfence"):
+                    cookies["qfence"] = cookie_data["qfence"]
+                
+                print(f"🍪 Using cookies for API calls: {list(cookies.keys())}")
+            except Exception as e:
+                print(f"⚠️ Error parsing cookies: {e}")
+        
+        # Fallback to OAuth token if no cookies or as backup
+        if credentials.access_token and credentials.access_token != "using_cookies":
+            headers["Authorization"] = f"Bearer {credentials.access_token}"
+            headers["freelancer-oauth-v1"] = credentials.access_token
+            print("🔑 Using OAuth token for API calls")
+        
+        print(f"🔍 Fetching projects for user {user.email}")
+        
+        # Step 1: First validate credentials by checking user profile
+        user_skills = []
+        user_validated = False
+        
+        try:
+            user_profile_url = "https://www.freelancer.com/api/users/0.1/self?limit=1&jobs=true&webapp=1&compact=true&new_errors=true&new_pools=true"
+            
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                user_response = await client.get(user_profile_url, headers=headers, cookies=cookies)
+                
+                if user_response.status_code == 200:
+                    user_data = user_response.json()
+                    user_profile = user_data.get("result", {})
+                    user_validated = True
+                    
+                    # Extract skill IDs from user profile
+                    if user_profile.get("jobs") and len(user_profile["jobs"]) > 0:
+                        user_skills = [job["id"] for job in user_profile["jobs"]]
+                        skill_names = [job["name"] for job in user_profile["jobs"]]
+                        print(f"✓ Found user skills: {user_skills}")
+                        print(f"✓ Skill names: {skill_names}")
+                    else:
+                        print("ℹ️ No skills found in user profile")
+                elif user_response.status_code == 401:
+                    print(f"❌ Authentication failed: {user_response.status_code}")
+                    raise HTTPException(status_code=401, detail="Freelancer credentials expired. Please reconnect to Freelancer using the extension.")
+                else:
+                    print(f"⚠️ Could not get user profile: {user_response.status_code}")
+                    # Continue without skills but with a warning
+        except HTTPException:
+            raise  # Re-raise HTTP exceptions
+        except Exception as e:
+            print(f"⚠️ Error getting user skills: {e}")
+            # Continue without skills
+        
+        # If user validation failed completely, return error
+        if not user_validated:
+            raise HTTPException(status_code=401, detail="Cannot validate Freelancer credentials. Please reconnect to Freelancer using the extension.")
+        
+        # Step 2: Build search URL based on user skills (exactly like extension)
+        if user_skills:
+            # Use skills-based search with jobs[] parameters for each skill ID
+            skills_params = "&".join([f"jobs[]={skill_id}" for skill_id in user_skills])
+            search_url = f"https://www.freelancer.com/api/projects/0.1/projects/active/?compact=true&limit=20&user_details=true&jobs=true&{skills_params}&languages[]=en"
+            print(f"🎯 Searching projects with user skills: {user_skills}")
+            print(f"🔗 Search URL: {search_url}")
+        else:
+            # Fallback to recommended projects if no skills found
+            search_url = "https://www.freelancer.com/api/projects/0.1/projects/active/?compact=true&limit=20&user_details=true&jobs=true&user_recommended=true"
+            print("📋 Using recommended projects (no skills found)")
+        
+        # Apply additional filters if provided
+        url_parts = search_url.split('?')
+        base_url = url_parts[0]
+        existing_params = url_parts[1] if len(url_parts) > 1 else ""
+        
+        additional_params = []
+        if search:
+            additional_params.append(f"query={search}")
+        if minBudget:
+            additional_params.append(f"min_budget={minBudget}")
+        if maxBudget:
+            additional_params.append(f"max_budget={maxBudget}")
+        
+        # No sorting - use Freelancer API default (newest first)
+        
+        # Combine all parameters
+        all_params = existing_params
+        if additional_params:
+            if all_params:
+                all_params += "&" + "&".join(additional_params)
+            else:
+                all_params = "&".join(additional_params)
+        
+        final_url = f"{base_url}?{all_params}"
+        print(f"🌐 Final API URL: {final_url}")
+        
+        # Step 3: Fetch projects using the constructed URL
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(final_url, headers=headers, cookies=cookies)
+            
+            if response.status_code == 401:
+                raise HTTPException(status_code=401, detail="Freelancer credentials expired. Please reconnect.")
+            elif response.status_code != 200:
+                error_text = await response.text()
+                print(f"❌ API Error: {response.status_code} - {error_text}")
+                raise HTTPException(status_code=response.status_code, detail="Failed to fetch projects from Freelancer")
+            
+            data = response.json()
+            projects = data.get("result", {}).get("projects", [])
+            users = data.get("result", {}).get("users", {})
+            
+            print(f"✅ Successfully fetched {len(projects)} projects")
+            
+            # Check if we have users data, if not fetch it separately
+            if not users and projects:
+                print("🔍 No users data in projects response, fetching client details...")
+                try:
+                    # Get unique owner IDs from projects
+                    owner_ids = list(set([
+                        str(project.get('owner_id')) 
+                        for project in projects 
+                        if project.get('owner_id')
+                    ]))
+                    
+                    if owner_ids:
+                        print(f"🔍 Fetching details for {len(owner_ids)} project owners: {owner_ids[:5]}...")
+                        # Build users API URL
+                        users_ids_param = "&".join([f"users[]={uid}" for uid in owner_ids[:20]])
+                        users_url = f"https://www.freelancer.com/api/users/0.1/users/?{users_ids_param}&avatar=true&country_details=true&reputation=true&display_info=true"
+                        
+                        users_response = await client.get(users_url, headers=headers, cookies=cookies)
+                        if users_response.status_code == 200:
+                            users_data = users_response.json()
+                            if 'result' in users_data and 'users' in users_data['result']:
+                                users = {
+                                    str(user['id']): user 
+                                    for user in users_data['result']['users']
+                                }
+                                print(f"✅ Successfully fetched {len(users)} client details")
+                            else:
+                                print("⚠️ No users found in users API response")
+                        else:
+                            print(f"⚠️ Failed to fetch client details: {users_response.status_code}")
+                except Exception as e:
+                    print(f"⚠️ Error fetching client details: {e}")
+            elif users:
+                print(f"✅ Users data already available: {len(users)} users")
+                # Convert users list to dict if needed
+                if isinstance(users, list):
+                    users = {
+                        str(user['id']): user 
+                        for user in users
+                    }
+            
+            # Add metadata about the search
+            search_info = {
+                "skills_used": len(user_skills) > 0,
+                "skill_count": len(user_skills),
+                "search_type": "skills-based" if user_skills else "recommended",
+                "total_projects": len(projects),
+                "users_count": len(users) if users else 0
+            }
+            
+            return {
+                "projects": projects,
+                "users": users,
+                "search_info": search_info
+            }
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error fetching Freelancer projects: {e}")
+        import traceback
+        traceback.print_exc()
+        raise HTTPException(status_code=500, detail="Failed to fetch projects")
+
+@app.get("/api/freelancer/projects/count")
+async def get_freelancer_projects_count(
+    email: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    """Get count of available projects"""
+    try:
+        # For now, return a mock count. In production, this would call the Freelancer API
+        return {"count": 25}
+    except Exception as e:
+        print(f"Error getting project count: {e}")
+        return {"count": 0}
+
+@app.get("/api/freelancer/messages/threads")
+async def get_freelancer_message_threads(
+    email: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    """Get message threads from Freelancer.com"""
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    
+    try:
+        from models import User, FreelancerCredentials
+        
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        credentials = db.query(FreelancerCredentials).filter(
+            FreelancerCredentials.user_id == user.id
+        ).first()
+        
+        if not credentials or not credentials.is_validated:
+            raise HTTPException(status_code=400, detail="Not connected to Freelancer.com")
+        
+        # Prepare headers and cookies for Freelancer API
+        headers, cookies = prepare_freelancer_request(credentials)
+        
+        api_url = "https://www.freelancer.com/api/messages/0.1/threads/?limit=20&user_details=true"
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(api_url, headers=headers, cookies=cookies)
+            
+            if response.status_code == 401:
+                raise HTTPException(status_code=401, detail="Freelancer credentials expired. Please reconnect.")
+            elif response.status_code != 200:
+                raise HTTPException(status_code=response.status_code, detail="Failed to fetch message threads")
+            
+            data = response.json()
+            
+            return data
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error fetching message threads: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch message threads")
+
+@app.get("/api/freelancer/messages/count")
+async def get_freelancer_messages_count(
+    email: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    """Get count of message threads"""
+    try:
+        # For now, return a mock count. In production, this would call the Freelancer API
+        return {"count": 8}
+    except Exception as e:
+        print(f"Error getting message count: {e}")
+        return {"count": 0}
+
+@app.get("/api/freelancer/messages/{thread_id}")
+async def get_freelancer_messages(
+    thread_id: int,
+    email: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    """Get messages from a specific thread"""
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    
+    try:
+        from models import User, FreelancerCredentials
+        
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        credentials = db.query(FreelancerCredentials).filter(
+            FreelancerCredentials.user_id == user.id
+        ).first()
+        
+        if not credentials or not credentials.is_validated:
+            raise HTTPException(status_code=400, detail="Not connected to Freelancer.com")
+        
+        # Prepare headers and cookies for Freelancer API
+        headers, cookies = prepare_freelancer_request(credentials)
+        
+        api_url = f"https://www.freelancer.com/api/messages/0.1/messages/?threads[]={thread_id}&limit=50"
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(api_url, headers=headers, cookies=cookies)
+            
+            if response.status_code == 401:
+                raise HTTPException(status_code=401, detail="Freelancer credentials expired. Please reconnect.")
+            elif response.status_code != 200:
+                raise HTTPException(status_code=response.status_code, detail="Failed to fetch messages")
+            
+            data = response.json()
+            
+            # Add from_me flag based on user ID
+            user_id = credentials.freelancer_user_id
+            if 'result' in data and 'messages' in data['result']:
+                for message in data['result']['messages']:
+                    message["from_me"] = str(message.get("from_user")) == str(user_id)
+            
+            return data
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error fetching messages: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch messages")
+
+@app.post("/api/freelancer/messages/send")
+async def send_freelancer_message(
+    message_data: dict,
+    email: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    """Send a message to a Freelancer thread"""
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    
+    try:
+        from models import User, FreelancerCredentials
+        
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        credentials = db.query(FreelancerCredentials).filter(
+            FreelancerCredentials.user_id == user.id
+        ).first()
+        
+        if not credentials or not credentials.is_validated:
+            raise HTTPException(status_code=400, detail="Not connected to Freelancer.com")
+        
+        thread_id = message_data.get("threadId")
+        message = message_data.get("message")
+        file_url = message_data.get("fileUrl")
+        file_name = message_data.get("fileName")
+        
+        if not thread_id or (not message and not file_url):
+            raise HTTPException(status_code=400, detail="threadId and either message or fileUrl are required")
+        
+        # Prepare headers and cookies for Freelancer API
+        headers, cookies = prepare_freelancer_request(credentials)
+        
+        api_url = f"https://www.freelancer.com/api/messages/0.1/threads/{thread_id}/messages"
+        
+        # Check if this is a file attachment
+        if file_url and file_name:
+            # Try to send as multipart form data with file
+            headers["Content-Type"] = "multipart/form-data"
+            
+            # Prepare multipart form data
+            form_data = {
+                "message": message or f"📎 {file_name}",
+                "source": "chat_box",
+                "attachment_url": file_url,
+                "attachment_name": file_name
+            }
+        else:
+            # Regular text message
+            headers["Content-Type"] = "application/x-www-form-urlencoded"
+            form_data = {
+                "message": message,
+                "source": "chat_box"
+            }
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(api_url, headers=headers, cookies=cookies, data=form_data)
+            
+            if response.status_code == 401:
+                raise HTTPException(status_code=401, detail="Freelancer credentials expired. Please reconnect.")
+            elif response.status_code != 200:
+                raise HTTPException(status_code=response.status_code, detail="Failed to send message")
+            
+            return {"success": True, "message": "Message sent successfully"}
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error sending message: {e}")
+        raise HTTPException(status_code=500, detail="Failed to send message")
+
+@app.get("/api/freelancer/bids")
+async def get_freelancer_bids(
+    filter: str = "all",
+    email: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    """Get user's bids from Freelancer.com"""
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    
+    try:
+        from models import User, FreelancerCredentials
+        
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        credentials = db.query(FreelancerCredentials).filter(
+            FreelancerCredentials.user_id == user.id
+        ).first()
+        
+        if not credentials or not credentials.is_validated:
+            raise HTTPException(status_code=400, detail="Not connected to Freelancer.com")
+        
+        # Prepare headers and cookies for Freelancer API
+        headers, cookies = prepare_freelancer_request(credentials)
+        
+        # Get user's bids
+        user_id = credentials.freelancer_user_id
+        api_url = f"https://www.freelancer.com/api/projects/0.1/bids/?bidders[]={user_id}&limit=50"
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(api_url, headers=headers, cookies=cookies)
+            
+            if response.status_code == 401:
+                raise HTTPException(status_code=401, detail="Freelancer credentials expired. Please reconnect.")
+            elif response.status_code != 200:
+                raise HTTPException(status_code=response.status_code, detail="Failed to fetch bids")
+            
+            data = response.json()
+            
+            # Log the structure for debugging
+            print(f"📊 Bids API response structure: {list(data.keys())}")
+            if 'result' in data:
+                print(f"📊 Result keys: {list(data['result'].keys())}")
+                if 'bids' in data['result']:
+                    bids = data['result']['bids']
+                    print(f"📊 Found {len(bids)} bids")
+                    
+                    # Get unique project IDs from bids
+                    project_ids = list(set([bid.get('project_id') for bid in bids if bid.get('project_id')]))
+                    print(f"📊 Need to fetch details for {len(project_ids)} projects")
+                    
+                    # Check if we already have users data from the bids API
+                    if 'users' in data['result'] and data['result']['users']:
+                        print(f"✅ Users data already available from bids API: {len(data['result']['users'])} users")
+                        
+                        # Convert users list to dict if needed
+                        if isinstance(data['result']['users'], list):
+                            data['result']['users'] = {
+                                str(user['id']): user 
+                                for user in data['result']['users']
+                            }
+                            print(f"🔄 Converted users list to dict: {len(data['result']['users'])} users")
+                        
+                        # Log sample user data
+                        if data['result']['users']:
+                            first_user_id = list(data['result']['users'].keys())[0]
+                            first_user = data['result']['users'][first_user_id]
+                            print(f"👤 Sample user {first_user_id}: {first_user.get('display_name', first_user.get('username', 'NO_NAME'))}")
+                            print(f"👤 Sample user keys: {list(first_user.keys())[:10]}...")
+                    
+                    # Check if we already have projects data from the bids API
+                    if 'projects' in data['result'] and data['result']['projects']:
+                        print(f"✅ Projects data already available from bids API: {len(data['result']['projects'])} projects")
+                        
+                        # Convert projects list to dict if needed
+                        if isinstance(data['result']['projects'], list):
+                            data['result']['projects'] = {
+                                str(project['id']): project 
+                                for project in data['result']['projects']
+                            }
+                            print(f"🔄 Converted projects list to dict: {len(data['result']['projects'])} projects")
+                    
+                    # Only fetch additional project details if we don't have them
+                    if 'projects' not in data['result'] or not data['result']['projects']:
+                        print("🔍 No projects data in bids response, fetching separately...")
+                        try:
+                            # Build project details API URL
+                            project_ids_param = "&".join([f"projects[]={pid}" for pid in project_ids[:20]])  # Limit to 20 projects
+                            projects_url = f"https://www.freelancer.com/api/projects/0.1/projects/?{project_ids_param}&user_details=true"
+                            
+                            projects_response = await client.get(projects_url, headers=headers, cookies=cookies)
+                            if projects_response.status_code == 200:
+                                projects_data = projects_response.json()
+                                if 'result' in projects_data and 'projects' in projects_data['result']:
+                                    # Handle both list and dict formats for projects
+                                    projects_raw = projects_data['result']['projects']
+                                    if isinstance(projects_raw, list):
+                                        data['result']['projects'] = {
+                                            str(project['id']): project 
+                                            for project in projects_raw
+                                        }
+                                    else:
+                                        data['result']['projects'] = projects_raw
+                                    
+                                    print(f"✅ Fetched {len(data['result']['projects'])} projects separately")
+                                    
+                                    # Also get users data if available
+                                    if 'users' in projects_data['result'] and projects_data['result']['users']:
+                                        if isinstance(projects_data['result']['users'], list):
+                                            data['result']['users'] = {
+                                                str(user['id']): user 
+                                                for user in projects_data['result']['users']
+                                            }
+                                        else:
+                                            data['result']['users'] = projects_data['result']['users']
+                                        print(f"✅ Also got {len(data['result']['users'])} users from projects API")
+                                else:
+                                    print("⚠️ No projects found in projects API response")
+                            else:
+                                print(f"⚠️ Failed to fetch projects: {projects_response.status_code}")
+                        except Exception as e:
+                            print(f"⚠️ Error fetching projects separately: {e}")
+                    else:
+                        print("✅ Using existing projects and users data from bids API")
+                
+                if 'projects' in data['result']:
+                    print(f"📊 Found {len(data['result']['projects'])} projects")
+            
+            return data
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error fetching bids: {e}")
+        raise HTTPException(status_code=500, detail="Failed to fetch bids")
+
+@app.get("/api/freelancer/bids/count")
+async def get_freelancer_bids_count(
+    email: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    """Get count of user's bids"""
+    try:
+        # For now, return a mock count. In production, this would call the Freelancer API
+        return {"count": 12}
+    except Exception as e:
+        print(f"Error getting bid count: {e}")
+        return {"count": 0}
+
+@app.post("/api/freelancer/bid")
+async def place_freelancer_bid(
+    bid_data: dict,
+    email: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    """Place a bid on a Freelancer project"""
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    
+    try:
+        from models import User, FreelancerCredentials
+        
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        credentials = db.query(FreelancerCredentials).filter(
+            FreelancerCredentials.user_id == user.id
+        ).first()
+        
+        if not credentials or not credentials.is_validated:
+            raise HTTPException(status_code=400, detail="Not connected to Freelancer.com")
+        
+        project_id = bid_data.get("projectId")
+        amount = bid_data.get("amount")
+        message = bid_data.get("message", "")
+        period = bid_data.get("period", 7)
+        
+        if not project_id or not amount:
+            raise HTTPException(status_code=400, detail="projectId and amount are required")
+        
+        # Prepare headers for Freelancer API
+        headers = {
+            "Content-Type": "application/x-www-form-urlencoded"
+        }
+        
+        if credentials.access_token and credentials.access_token != "using_cookies":
+            headers["Authorization"] = f"Bearer {credentials.access_token}"
+            headers["freelancer-oauth-v1"] = credentials.access_token
+        
+        api_url = f"https://www.freelancer.com/api/projects/0.1/projects/{project_id}/bids"
+        
+        # Prepare form data
+        form_data = {
+            "bidder_id": credentials.freelancer_user_id,
+            "amount": str(amount),
+            "period": str(period),
+            "description": message,
+            "milestone_percentage": "100"
+        }
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.post(api_url, headers=headers, data=form_data)
+            
+            if response.status_code == 401:
+                raise HTTPException(status_code=401, detail="Freelancer credentials expired. Please reconnect.")
+            elif response.status_code != 200:
+                error_text = response.text
+                raise HTTPException(status_code=response.status_code, detail=f"Failed to place bid: {error_text}")
+            
+            return {"success": True, "message": "Bid placed successfully"}
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error placing bid: {e}")
+        raise HTTPException(status_code=500, detail="Failed to place bid")
+
+@app.delete("/api/freelancer/bids/{bid_id}/retract")
+async def retract_freelancer_bid(
+    bid_id: int,
+    email: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    """Retract a bid on Freelancer"""
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    
+    try:
+        from models import User, FreelancerCredentials
+        
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        credentials = db.query(FreelancerCredentials).filter(
+            FreelancerCredentials.user_id == user.id
+        ).first()
+        
+        if not credentials or not credentials.is_validated:
+            raise HTTPException(status_code=400, detail="Not connected to Freelancer.com")
+        
+        # Prepare headers for Freelancer API
+        headers = {"Content-Type": "application/json"}
+        
+        if credentials.access_token and credentials.access_token != "using_cookies":
+            headers["Authorization"] = f"Bearer {credentials.access_token}"
+            headers["freelancer-oauth-v1"] = credentials.access_token
+        
+        api_url = f"https://www.freelancer.com/api/projects/0.1/bids/{bid_id}/"
+        
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.delete(api_url, headers=headers)
+            
+            if response.status_code == 401:
+                raise HTTPException(status_code=401, detail="Freelancer credentials expired. Please reconnect.")
+            elif response.status_code not in [200, 204]:
+                raise HTTPException(status_code=response.status_code, detail="Failed to retract bid")
+            
+            return {"success": True, "message": "Bid retracted successfully"}
+            
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"Error retracting bid: {e}")
+        raise HTTPException(status_code=500, detail="Failed to retract bid")
+
+@app.get("/api/freelancer/settings")
+async def get_freelancer_settings(
+    email: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    """Get freelancer automation settings"""
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    
+    try:
+        from models import User, UserSettings
+        
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        settings = db.query(UserSettings).filter(UserSettings.user_id == user.id).first()
+        
+        # Return default settings if none exist
+        if not settings:
+            return {
+                "settings": {
+                    "autoBidEnabled": False,
+                    "maxBidsPerDay": 10,
+                    "minBudget": 50,
+                    "maxBudget": 1000,
+                    "bidMessage": "Hi! I'm interested in your project and have the skills needed to deliver high-quality results. Let's discuss the details!",
+                    "autoReplyEnabled": False,
+                    "autoReplyMessage": "Thank you for your message. I'll get back to you shortly!"
+                }
+            }
+        
+        return {
+            "settings": {
+                "autoBidEnabled": getattr(settings, 'auto_bid_enabled', False),
+                "maxBidsPerDay": getattr(settings, 'max_bids_per_day', 10),
+                "minBudget": getattr(settings, 'min_budget', 50),
+                "maxBudget": getattr(settings, 'max_budget', 1000),
+                "bidMessage": getattr(settings, 'bid_message', "Hi! I'm interested in your project and have the skills needed to deliver high-quality results. Let's discuss the details!"),
+                "autoReplyEnabled": getattr(settings, 'auto_reply_enabled', False),
+                "autoReplyMessage": getattr(settings, 'auto_reply_message', "Thank you for your message. I'll get back to you shortly!")
+            }
+        }
+        
+    except Exception as e:
+        print(f"Error getting freelancer settings: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get settings")
+
+@app.put("/api/freelancer/settings")
+async def update_freelancer_settings(
+    settings_data: dict,
+    email: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    """Update freelancer automation settings"""
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    
+    try:
+        from models import User, UserSettings
+        
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        settings = db.query(UserSettings).filter(UserSettings.user_id == user.id).first()
+        if not settings:
+            settings = UserSettings(user_id=user.id)
+            db.add(settings)
+        
+        # Update freelancer-specific settings
+        freelancer_settings = settings_data.get("settings", {})
+        
+        # Note: These fields would need to be added to the UserSettings model
+        # For now, we'll just return success
+        
+        settings.updated_at = datetime.utcnow()
+        db.commit()
+        
+        return {"success": True, "message": "Settings updated successfully"}
+        
+    except Exception as e:
+        print(f"Error updating freelancer settings: {e}")
+        raise HTTPException(status_code=500, detail="Failed to update settings")
+
+@app.delete("/api/freelancer/disconnect")
+async def disconnect_freelancer(
+    email: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    """Disconnect from Freelancer.com by removing credentials"""
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    
+    try:
+        from models import User, FreelancerCredentials
+        
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        credentials = db.query(FreelancerCredentials).filter(
+            FreelancerCredentials.user_id == user.id
+        ).first()
+        
+        if credentials:
+            db.delete(credentials)
+            db.commit()
+        
+        return {"success": True, "message": "Disconnected from Freelancer.com"}
+        
+    except Exception as e:
+        print(f"Error disconnecting from Freelancer: {e}")
+        raise HTTPException(status_code=500, detail="Failed to disconnect")
+
+@app.post("/api/freelancer/refresh-cache")
+async def refresh_freelancer_cache(
+    email: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    """Force refresh of Freelancer connection cache"""
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    
+    try:
+        from models import User, FreelancerCredentials
+        from datetime import datetime
+        
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        # Reset validation timestamp to force recheck
+        credentials = db.query(FreelancerCredentials).filter(
+            FreelancerCredentials.user_id == user.id
+        ).first()
+        
+        if credentials:
+            credentials.last_validated = None
+            db.commit()
+        
+        return {"success": True, "message": "Cache refreshed"}
+        
+    except Exception as e:
+        print(f"Error refreshing cache: {e}")
+        raise HTTPException(status_code=500, detail="Failed to refresh cache")
+
+# Helper function to prepare headers and cookies for Freelancer API calls
+def prepare_freelancer_request(credentials):
+    """Prepare headers and cookies for Freelancer API requests"""
+    headers = {"Content-Type": "application/json"}
+    cookies = {}
+    
+    # Use cookies if available (faster than OAuth)
+    if credentials.cookies:
+        try:
+            cookie_data = credentials.cookies if isinstance(credentials.cookies, dict) else json.loads(credentials.cookies)
+            
+            # Set up cookies for the request
+            if cookie_data.get("GETAFREE_USER_ID"):
+                cookies["GETAFREE_USER_ID"] = cookie_data["GETAFREE_USER_ID"]
+            if cookie_data.get("GETAFREE_AUTH_HASH_V2"):
+                cookies["GETAFREE_AUTH_HASH_V2"] = cookie_data["GETAFREE_AUTH_HASH_V2"]
+            if cookie_data.get("XSRF_TOKEN"):
+                cookies["XSRF-TOKEN"] = cookie_data["XSRF_TOKEN"]
+                headers["X-XSRF-TOKEN"] = cookie_data["XSRF_TOKEN"]
+            if cookie_data.get("session2"):
+                cookies["session2"] = cookie_data["session2"]
+            if cookie_data.get("qfence"):
+                cookies["qfence"] = cookie_data["qfence"]
+            
+            print(f"🍪 Using cookies: {list(cookies.keys())}")
+        except Exception as e:
+            print(f"⚠️ Error parsing cookies: {e}")
+    
+    # Fallback to OAuth token if no cookies or as backup
+    if credentials.access_token and credentials.access_token != "using_cookies":
+        headers["Authorization"] = f"Bearer {credentials.access_token}"
+        headers["freelancer-oauth-v1"] = credentials.access_token
+        print("🔑 Using OAuth token")
+    
+    return headers, cookies
+
+# Extension integration endpoints
+@app.post("/api/freelancer/sync")
+async def sync_freelancer_credentials(
+    request_data: dict,
+    email: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    """Sync Freelancer credentials from extension to backend"""
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    
+    try:
+        from models import User, FreelancerCredentials
+        from datetime import datetime
+        
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        # Extract data from extension format
+        access_token = request_data.get("accessToken") or request_data.get("access_token")
+        csrf_token = request_data.get("csrfToken") or request_data.get("csrf_token")
+        user_id = request_data.get("userId") or request_data.get("user_id")
+        auth_hash = request_data.get("authHash") or request_data.get("auth_hash")
+        freelancer_cookies = request_data.get("freelancerCookies") or request_data.get("freelancer_cookies")
+        validated_username = request_data.get("validatedUsername") or request_data.get("validated_username")
+        validated_email = request_data.get("validatedEmail") or request_data.get("validated_email") or request_data.get("userEmail")
+        is_validated = request_data.get("isValidated", True)
+        
+        print(f"🔄 Syncing Freelancer credentials for user {user.email}")
+        print(f"📊 Raw request data: {request_data}")
+        print(f"📊 Extracted data: hasToken={bool(access_token)}, hasUserId={bool(user_id)}, isValidated={is_validated}")
+        print(f"📊 Token preview: {access_token[:20] if access_token else None}...")
+        print(f"📊 Username: {validated_username}, Email: {validated_email}")
+        
+        # Get or create credentials record
+        credentials = db.query(FreelancerCredentials).filter(
+            FreelancerCredentials.user_id == user.id
+        ).first()
+        
+        if credentials:
+            # Update existing credentials
+            if access_token:
+                credentials.access_token = access_token
+            if csrf_token:
+                credentials.csrf_token = csrf_token
+            if user_id:
+                credentials.freelancer_user_id = str(user_id)
+            if auth_hash:
+                credentials.auth_hash = auth_hash
+            if freelancer_cookies:
+                credentials.cookies = freelancer_cookies if isinstance(freelancer_cookies, dict) else json.loads(freelancer_cookies)
+            if validated_username:
+                credentials.validated_username = validated_username
+            if validated_email:
+                credentials.validated_email = validated_email
+            
+            credentials.is_validated = is_validated
+            credentials.last_validated = datetime.utcnow() if is_validated else None
+            credentials.updated_at = datetime.utcnow()
+        else:
+            # Create new credentials
+            credentials = FreelancerCredentials(
+                user_id=user.id,
+                access_token=access_token,
+                csrf_token=csrf_token,
+                freelancer_user_id=str(user_id) if user_id else None,
+                auth_hash=auth_hash,
+                cookies=freelancer_cookies if isinstance(freelancer_cookies, dict) else (json.loads(freelancer_cookies) if freelancer_cookies else None),
+                validated_username=validated_username,
+                validated_email=validated_email,
+                is_validated=is_validated,
+                last_validated=datetime.utcnow() if is_validated else None
+            )
+            db.add(credentials)
+        
+        db.commit()
+        db.refresh(credentials)
+        
+        print(f"✅ Successfully synced Freelancer credentials for user {user.email}")
+        
+        return {
+            "success": True,
+            "message": "Credentials synced successfully",
+            "connected": is_validated
+        }
+        
+    except Exception as e:
+        print(f"❌ Error syncing Freelancer credentials: {e}")
+        if db:
+            db.rollback()
+        raise HTTPException(status_code=500, detail="Failed to sync credentials")
+
+@app.post("/api/user/info")
+async def get_user_info_with_cookies(
+    request_data: dict
+):
+    """Get user info using Freelancer cookies - for extension validation"""
+    try:
+        access_token = request_data.get("access_token")
+        freelancer_cookies = request_data.get("freelancer_cookies")
+        
+        if not access_token and not freelancer_cookies:
+            raise HTTPException(status_code=400, detail="access_token or freelancer_cookies required")
+        
+        # If we have an OAuth token, use it directly
+        if access_token and access_token != "using_cookies":
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "freelancer-oauth-v1": access_token
+            }
+            
+            async with httpx.AsyncClient(timeout=10.0) as client:
+                response = await client.get(
+                    "https://www.freelancer.com/api/users/0.1/self?compact=true",
+                    headers=headers
+                )
+                
+                if response.status_code == 200:
+                    data = response.json()
+                    return {"success": True, "data": data}
+        
+        # If using cookies, we'd need to implement cookie-based requests
+        # For now, return a mock response
+        return {
+            "success": False,
+            "error": "Cookie-based authentication not implemented in backend"
+        }
+        
+    except Exception as e:
+        print(f"Error getting user info: {e}")
+        return {"success": False, "error": str(e)}
+
+@app.get("/api/freelancer/profile")
+async def get_freelancer_profile(
+    email: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    """Get live Freelancer profile data using stored credentials - same as extension"""
+    if db is None:
+        raise HTTPException(status_code=500, detail="Database connection failed")
+    
+    try:
+        from models import User, FreelancerCredentials
+        
+        print(f"🔍 Looking for user with email: {email}")
+        user = db.query(User).filter(User.email == email).first()
+        if not user:
+            print(f"❌ User not found with email: {email}")
+            raise HTTPException(status_code=404, detail="User not found")
+        
+        print(f"✅ Found user: {user.email} (ID: {user.id})")
+        
+        # Get stored Freelancer credentials
+        credentials = db.query(FreelancerCredentials).filter(
+            FreelancerCredentials.user_id == user.id
+        ).first()
+        
+        if not credentials:
+            print(f"❌ No FreelancerCredentials found for user ID: {user.id}")
+            raise HTTPException(status_code=404, detail="No Freelancer credentials found. Please connect using the browser extension first.")
+        
+        if not credentials.access_token:
+            print(f"❌ No access_token in credentials for user ID: {user.id}")
+            raise HTTPException(status_code=404, detail="No access token found. Please reconnect using the browser extension.")
+        
+        print(f"✅ Found credentials with access_token: {credentials.access_token[:20]}...")
+        
+        # Use the same approach as projects endpoint - cookies + OAuth fallback
+        headers = {"Content-Type": "application/json"}
+        cookies = {}
+        
+        # Use cookies if available (same as projects endpoint)
+        if credentials.cookies:
+            try:
+                import json
+                cookie_data = credentials.cookies if isinstance(credentials.cookies, dict) else json.loads(credentials.cookies)
+                
+                # Set up cookies for the request (same as projects endpoint)
+                if cookie_data.get("GETAFREE_USER_ID"):
+                    cookies["GETAFREE_USER_ID"] = cookie_data["GETAFREE_USER_ID"]
+                if cookie_data.get("GETAFREE_AUTH_HASH_V2"):
+                    cookies["GETAFREE_AUTH_HASH_V2"] = cookie_data["GETAFREE_AUTH_HASH_V2"]
+                if cookie_data.get("XSRF_TOKEN"):
+                    cookies["XSRF-TOKEN"] = cookie_data["XSRF_TOKEN"]
+                    headers["X-XSRF-TOKEN"] = cookie_data["XSRF_TOKEN"]
+                if cookie_data.get("session2"):
+                    cookies["session2"] = cookie_data["session2"]
+                if cookie_data.get("qfence"):
+                    cookies["qfence"] = cookie_data["qfence"]
+                
+                print(f"🍪 Using cookies for API calls: {list(cookies.keys())}")
+            except Exception as e:
+                print(f"⚠️ Error parsing cookies: {e}")
+        
+        # Also add OAuth token as fallback (same as projects endpoint)
+        if credentials.access_token:
+            headers.update({
+                "Authorization": f"Bearer {credentials.access_token}",
+                "freelancer-oauth-v1": credentials.access_token
+            })
+            print(f"🔑 Using OAuth token for API calls")
+        
+        print(f"🔄 Making Freelancer API call...")
+        
+        async with httpx.AsyncClient(timeout=10.0) as client:
+            # Try to get user data with avatar information
+            response = await client.get(
+                "https://www.freelancer.com/api/users/0.1/self?limit=1&jobs=true&webapp=1&compact=true&new_errors=true&new_pools=true&avatar=true&profile_logo_url=true",
+                headers=headers,
+                cookies=cookies
+            )
+            
+            print(f"📡 Freelancer API response: {response.status_code}")
+            
+            if response.status_code == 401:
+                print(f"❌ Freelancer API returned 401 - session expired")
+                raise HTTPException(status_code=401, detail="Freelancer session expired - please reconnect using the extension")
+            
+            if response.status_code != 200:
+                print(f"❌ Freelancer API error: {response.status_code}")
+                raise HTTPException(status_code=response.status_code, detail=f"Freelancer API error: {response.status_code}")
+            
+            data = response.json()
+            user_data = data.get("result")
+            
+            if not user_data:
+                print(f"❌ No user data in Freelancer API response")
+                raise HTTPException(status_code=500, detail="No user data received from Freelancer API")
+            
+            print(f"✅ Successfully got Freelancer profile for: {user_data.get('username')}")
+            
+            # Try to get avatar URL if not present
+            if not any(key in user_data for key in ['avatar', 'avatar_url', 'profile_logo_url', 'logo_url']):
+                try:
+                    # Try to get avatar from users endpoint
+                    avatar_response = await client.get(
+                        f"https://www.freelancer.com/api/users/0.1/users/{user_data.get('id')}?avatar=true&profile_logo_url=true",
+                        headers=headers,
+                        cookies=cookies
+                    )
+                    if avatar_response.status_code == 200:
+                        avatar_data = avatar_response.json()
+                        if avatar_data.get('result') and avatar_data['result'].get('users'):
+                            user_with_avatar = avatar_data['result']['users'][0]
+                            # Merge avatar data into user_data
+                            for key in ['avatar', 'avatar_url', 'profile_logo_url', 'logo_url']:
+                                if key in user_with_avatar:
+                                    user_data[key] = user_with_avatar[key]
+                                    print(f"✅ Found avatar field: {key} = {user_with_avatar[key]}")
+                except Exception as e:
+                    print(f"⚠️ Could not fetch avatar data: {e}")
+            
+            return user_data
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        print(f"❌ Error getting Freelancer profile: {e}")
+        raise HTTPException(status_code=500, detail="Failed to get Freelancer profile")
+
+@app.post("/api/bid/place")
+async def place_bid_with_cookies(
+    request_data: dict
+):
+    """Place a bid using extension credentials"""
+    try:
+        access_token = request_data.get("access_token")
+        freelancer_cookies = request_data.get("freelancer_cookies")
+        project_id = request_data.get("project_id")
+        bidder_id = request_data.get("bidder_id")
+        amount = request_data.get("amount")
+        period = request_data.get("period", 7)
+        description = request_data.get("description", "")
+        
+        if not project_id or not bidder_id or not amount:
+            raise HTTPException(status_code=400, detail="project_id, bidder_id, and amount are required")
+        
+        # If we have an OAuth token, use it directly
+        if access_token and access_token != "using_cookies":
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "freelancer-oauth-v1": access_token,
+                "Content-Type": "application/x-www-form-urlencoded"
+            }
+            
+            form_data = {
+                "bidder_id": str(bidder_id),
+                "amount": str(amount),
+                "period": str(period),
+                "description": description,
+                "milestone_percentage": "100"
+            }
+            
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    f"https://www.freelancer.com/api/projects/0.1/projects/{project_id}/bids",
+                    headers=headers,
+                    data=form_data
+                )
+                
+                if response.status_code == 200:
+                    return {"success": True, "message": "Bid placed successfully"}
+                else:
+                    error_text = response.text
+                    return {"success": False, "error": f"API Error {response.status_code}: {error_text}"}
+        
+        # Cookie-based bidding would be implemented here
+        return {
+            "success": False,
+            "error": "Cookie-based bidding not implemented in backend"
+        }
+        
+    except Exception as e:
+        print(f"Error placing bid: {e}")
+        return {"success": False, "error": str(e)}
+
+@app.post("/api/message/send")
+async def send_message_with_cookies(
+    request_data: dict
+):
+    """Send a message using extension credentials"""
+    try:
+        access_token = request_data.get("access_token")
+        freelancer_cookies = request_data.get("freelancer_cookies")
+        thread_id = request_data.get("thread_id")
+        message = request_data.get("message")
+        
+        if not thread_id or not message:
+            raise HTTPException(status_code=400, detail="thread_id and message are required")
+        
+        # If we have an OAuth token, use it directly
+        if access_token and access_token != "using_cookies":
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "freelancer-oauth-v1": access_token,
+                "Content-Type": "application/x-www-form-urlencoded"
+            }
+            
+            form_data = {
+                "message": message,
+                "source": "chat_box"
+            }
+            
+            async with httpx.AsyncClient(timeout=30.0) as client:
+                response = await client.post(
+                    f"https://www.freelancer.com/api/messages/0.1/threads/{thread_id}/messages",
+                    headers=headers,
+                    data=form_data
+                )
+                
+                if response.status_code == 200:
+                    return {"success": True, "message": "Message sent successfully"}
+                else:
+                    error_text = response.text
+                    return {"success": False, "error": f"API Error {response.status_code}: {error_text}"}
+        
+        # Cookie-based messaging would be implemented here
+        return {
+            "success": False,
+            "error": "Cookie-based messaging not implemented in backend"
+        }
+        
+    except Exception as e:
+        print(f"Error sending message: {e}")
+        return {"success": False, "error": str(e)}

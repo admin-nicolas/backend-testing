@@ -1,5 +1,6 @@
 from pydantic import BaseModel, EmailStr, field_validator
-from typing import Optional, List
+from typing import Optional, List, Dict, Any, Union
+from datetime import datetime
 
 class UserSignup(BaseModel):
     email: str
@@ -48,12 +49,8 @@ class SettingsUpdate(BaseModel):
     upwork_job_categories: Optional[List[str]] = None
     upwork_max_jobs: Optional[int] = None
     upwork_payment_verified: Optional[bool] = None
-    upwork_auto_fetch: Optional[bool] = None
-    upwork_auto_fetch_interval: Optional[int] = None
     freelancer_job_category: Optional[str] = None
     freelancer_max_jobs: Optional[int] = None
-    freelancer_auto_fetch: Optional[bool] = None
-    freelancer_auto_fetch_interval: Optional[int] = None
     ai_agent_min_score: Optional[int] = None
     ai_agent_max_score: Optional[int] = None
     ai_agent_model: Optional[str] = None
@@ -65,12 +62,8 @@ class SettingsResponse(BaseModel):
     upwork_job_categories: List[str]
     upwork_max_jobs: int
     upwork_payment_verified: bool
-    upwork_auto_fetch: bool
-    upwork_auto_fetch_interval: int
     freelancer_job_category: str
     freelancer_max_jobs: int
-    freelancer_auto_fetch: bool
-    freelancer_auto_fetch_interval: int
     ai_agent_min_score: int
     ai_agent_max_score: int
     ai_agent_model: str
@@ -119,3 +112,39 @@ class TalentResponse(BaseModel):
     
     class Config:
         from_attributes = True
+class FreelancerCredentialsCreate(BaseModel):
+    access_token: Optional[str] = None
+    csrf_token: Optional[str] = None
+    freelancer_user_id: Optional[Union[str, int]] = None
+    auth_hash: Optional[str] = None
+    cookies: Optional[Dict[str, Any]] = None
+    validated_username: Optional[str] = None
+    validated_email: Optional[str] = None
+
+class FreelancerCredentialsResponse(BaseModel):
+    id: int
+    user_id: int
+    access_token: Optional[str] = None
+    csrf_token: Optional[str] = None
+    freelancer_user_id: Optional[str] = None
+    auth_hash: Optional[str] = None
+    cookies: Optional[Dict[str, Any]] = None
+    is_validated: bool = False
+    validated_username: Optional[str] = None
+    validated_email: Optional[str] = None
+    created_at: datetime
+    updated_at: datetime
+    last_validated: Optional[datetime] = None
+    
+    class Config:
+        from_attributes = True
+
+class FreelancerCredentialsUpdate(BaseModel):
+    access_token: Optional[str] = None
+    csrf_token: Optional[str] = None
+    freelancer_user_id: Optional[Union[str, int]] = None
+    auth_hash: Optional[str] = None
+    cookies: Optional[Dict[str, Any]] = None
+    is_validated: Optional[bool] = None
+    validated_username: Optional[str] = None
+    validated_email: Optional[str] = None

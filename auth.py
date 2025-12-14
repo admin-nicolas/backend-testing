@@ -29,15 +29,20 @@ def create_access_token(data: dict):
 def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
     try:
         token = credentials.credentials
+        print(f"🔐 [AUTH] Verifying token: {token[:30]}...")
         payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
         email: str = payload.get("sub")
+        print(f"🔐 [AUTH] Extracted email from token: {email}")
+        print(f"🔐 [AUTH] Token payload: {payload}")
         if email is None:
+            print(f"❌ [AUTH] No email found in token payload")
             raise HTTPException(
                 status_code=status.HTTP_401_UNAUTHORIZED,
                 detail="Invalid authentication credentials"
             )
         return email
-    except JWTError:
+    except JWTError as e:
+        print(f"❌ [AUTH] JWT Error: {e}")
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Invalid authentication credentials"

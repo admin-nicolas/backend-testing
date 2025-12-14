@@ -69,16 +69,10 @@ class UserSettings(Base):
     upwork_job_categories = Column(JSON, default=lambda: ["Web Development"])
     upwork_max_jobs = Column(Integer, default=3)
     upwork_payment_verified = Column(Boolean, default=False)
-    upwork_auto_fetch = Column(Boolean, default=False)
-    upwork_auto_fetch_interval = Column(Integer, default=2)  # in minutes
-    upwork_last_auto_fetch = Column(DateTime, nullable=True)  # Last time auto-fetch ran
     
     # Freelancer settings
     freelancer_job_category = Column(String, default="Web Development")
     freelancer_max_jobs = Column(Integer, default=3)
-    freelancer_auto_fetch = Column(Boolean, default=False)
-    freelancer_auto_fetch_interval = Column(Integer, default=3)  # in minutes
-    freelancer_last_auto_fetch = Column(DateTime, nullable=True)  # Last time auto-fetch ran
     
     # AI Agent settings
     ai_agent_min_score = Column(Integer, default=2)  # Minimum score for auto-draft
@@ -158,3 +152,31 @@ class ChatMessage(Base):
     # Relationships
     user = relationship("User")
     lead = relationship("Lead")
+
+class FreelancerCredentials(Base):
+    __tablename__ = "freelancer_credentials"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, unique=True, index=True)
+    
+    # Freelancer authentication data
+    access_token = Column(Text, nullable=True)  # OAuth access token
+    csrf_token = Column(String, nullable=True)  # CSRF token
+    freelancer_user_id = Column(String, nullable=True)  # Freelancer user ID
+    auth_hash = Column(Text, nullable=True)  # Auth hash from cookies
+    
+    # Session cookies (stored as JSON)
+    cookies = Column(JSON, nullable=True)  # All Freelancer cookies
+    
+    # Validation status
+    is_validated = Column(Boolean, default=False)  # Whether credentials are validated
+    validated_username = Column(String, nullable=True)  # Freelancer username
+    validated_email = Column(String, nullable=True)  # Freelancer email
+    
+    # Timestamps
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    last_validated = Column(DateTime, nullable=True)  # Last time credentials were validated
+    
+    # Relationship
+    user = relationship("User")
