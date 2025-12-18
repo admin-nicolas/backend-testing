@@ -3619,7 +3619,7 @@ async def get_freelancer_projects(
                         print(f"🔍 Fetching details for {len(owner_ids)} project owners: {owner_ids[:5]}...")
                         # Build users API URL
                         users_ids_param = "&".join([f"users[]={uid}" for uid in owner_ids[:20]])
-                        users_url = f"https://www.freelancer.com/api/users/0.1/users/?{users_ids_param}&avatar=true&country_details=true&reputation=true&display_info=true"
+                        users_url = f"https://www.freelancer.com/api/users/0.1/users/?{users_ids_param}&avatar=true&country_details=true&reputation=true&display_info=true&status=true&verification=true&qualification_details=true&membership_details=true"
                         
                         users_response = await client.get(users_url, headers=headers, cookies=cookies)
                         if users_response.status_code == 200:
