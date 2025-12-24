@@ -148,3 +148,11 @@ class FreelancerCredentialsUpdate(BaseModel):
     is_validated: Optional[bool] = None
     validated_username: Optional[str] = None
     validated_email: Optional[str] = None
+
+class AutoBidSettings(BaseModel):
+    enabled: Optional[bool] = None
+    min_budget: Optional[float] = None
+    max_budget: Optional[float] = None
+    frequency_minutes: Optional[int] = None
+    max_project_bids: Optional[int] = None
+    smart_bidding: Optional[bool] = None

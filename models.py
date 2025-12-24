@@ -180,3 +180,39 @@ class FreelancerCredentials(Base):
     
     # Relationship
     user = relationship("User")
+
+class BidHistory(Base):
+    __tablename__ = "bid_history"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    project_id = Column(String, nullable=False)  # Freelancer project ID
+    project_title = Column(String, nullable=False)
+    project_url = Column(String, nullable=True)
+    bid_amount = Column(Float, nullable=False)
+    proposal_text = Column(Text, nullable=True)
+    status = Column(String, nullable=False)  # 'success', 'failed', 'pending'
+    error_message = Column(Text, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    
+    # Relationship
+    user = relationship("User")
+
+class AutoBidSettings(Base):
+    __tablename__ = "auto_bid_settings"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, unique=True, index=True)
+    
+    enabled = Column(Boolean, default=False)
+    min_budget = Column(Float, default=10.0)
+    max_budget = Column(Float, default=1000.0)
+    frequency_minutes = Column(Integer, default=10)
+    max_project_bids = Column(Integer, default=50)  # Max existing bids on project
+    smart_bidding = Column(Boolean, default=True)  # Use average of min/max
+    
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationship
+    user = relationship("User")

@@ -13,7 +13,8 @@ from concurrent.futures import ThreadPoolExecutor
 from cache_utils import cached, cleanup_cache
 import threading
 import time
-from schemas import UserSignup, UserLogin, Token, UserResponse, SettingsUpdate, SettingsResponse, UserProfileUpdate, TalentCreate, TalentUpdate, TalentResponse, FreelancerCredentialsCreate, FreelancerCredentialsResponse, FreelancerCredentialsUpdate
+from schemas import UserSignup, UserLogin, Token, UserResponse, SettingsUpdate, SettingsResponse, UserProfileUpdate, TalentCreate, TalentUpdate, TalentResponse, FreelancerCredentialsCreate, FreelancerCredentialsResponse, FreelancerCredentialsUpdate, AutoBidSettings
+from autobid_service import bidder as autobidder
 from auth import get_password_hash, verify_password, create_access_token, verify_token, SECRET_KEY, ALGORITHM
 import json
 from urllib.parse import unquote
@@ -37,8 +38,50 @@ def start_cache_cleanup():
     cleanup_thread = threading.Thread(target=cleanup_task, daemon=True)
     cleanup_thread.start()
 
-# Start cleanup on app startup
-start_cache_cleanup()
+# Start services on startup
+@app.on_event("startup")
+async def startup_event():
+    start_cache_cleanup()
+    
+    # Load auto-bidder settings from database and start if enabled
+    try:
+        from database import SessionLocal
+        from models import AutoBidSettings as DBAutoBidSettings
+        
+        db = SessionLocal()
+        try:
+            # Get first user's settings (or any enabled settings)
+            db_settings = db.query(DBAutoBidSettings).filter(
+                DBAutoBidSettings.enabled == True
+            ).first()
+            
+            if db_settings:
+                print(f"🚀 Loading auto-bidder settings for user {db_settings.user_id}")
+                
+                # Update in-memory settings
+                settings_dict = {
+                    "enabled": db_settings.enabled,
+                    "min_budget": float(db_settings.min_budget),
+                    "max_budget": float(db_settings.max_budget),
+                    "frequency_minutes": db_settings.frequency_minutes,
+                    "max_project_bids": db_settings.max_project_bids,
+                    "smart_bidding": db_settings.smart_bidding
+                }
+                autobidder.update_settings(settings_dict)
+                
+                print(f"✅ Auto-bidder starting automatically (enabled in database)")
+                print(f"   Settings: Budget ${settings_dict['min_budget']}-${settings_dict['max_budget']}, Frequency: {settings_dict['frequency_minutes']}min")
+            else:
+                print("ℹ️  Auto-bidder not enabled in database, staying off")
+        finally:
+            db.close()
+    except Exception as e:
+        print(f"⚠️  Error loading auto-bidder settings: {e}")
+        # Continue without auto-bidder if there's an error
+
+@app.on_event("shutdown")
+async def shutdown_event():
+    autobidder.stop()
 
 
 
@@ -425,6 +468,82 @@ async def trigger_webhook_async(webhook_url: str, payload: dict, headers: dict):
         return {"success": False, "error": "Request timeout", "status_code": 504}
     except Exception as e:
         return {"success": False, "error": str(e), "status_code": 500}
+
+@app.get("/api/autobid/stats")
+async def get_autobid_stats(email: str = Depends(verify_token), db: Session = Depends(get_db)):
+    try:
+        from models import BidHistory, AutoBidSettings
+        
+        user = get_user_by_email(email, db)
+        
+        now = datetime.utcnow()
+        today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
+        week_start = today_start - timedelta(days=today_start.weekday())  # Start of week (Monday)
+        
+        # 1. Bids Today
+        bids_today = db.query(BidHistory).filter(
+            BidHistory.user_id == user.id,
+            BidHistory.created_at >= today_start
+        ).count()
+        
+        # 2. Bids This Week
+        bids_week = db.query(BidHistory).filter(
+            BidHistory.user_id == user.id,
+            BidHistory.created_at >= week_start
+        ).count()
+        
+        # 3. Success Bids Week
+        success_week = db.query(BidHistory).filter(
+            BidHistory.user_id == user.id,
+            BidHistory.created_at >= week_start,
+            func.lower(BidHistory.status).in_(['success', 'accepted', 'awarded'])
+        ).count()
+        
+        # 4. Failed Bids Week
+        failed_week = db.query(BidHistory).filter(
+            BidHistory.user_id == user.id,
+            BidHistory.created_at >= week_start,
+            func.lower(BidHistory.status).in_(['failed', 'rejected', 'declined', 'error'])
+        ).count()
+        
+        # 5. Bid Amount Today
+        bid_amount_today = db.query(func.sum(BidHistory.bid_amount)).filter(
+            BidHistory.user_id == user.id,
+            BidHistory.created_at >= today_start
+        ).scalar() or 0
+        
+        # 6. Bid Amount This Week
+        bid_amount_week = db.query(func.sum(BidHistory.bid_amount)).filter(
+            BidHistory.user_id == user.id,
+            BidHistory.created_at >= week_start
+        ).scalar() or 0
+        
+        # 7. Auto-Bidder Status
+        settings = db.query(AutoBidSettings).filter(AutoBidSettings.user_id == user.id).first()
+        is_running = settings.enabled if settings else False
+        
+        return {
+            "bids_today": bids_today,
+            "bids_week": bids_week,
+            "success_week": success_week,
+            "failed_week": failed_week,
+            "bid_amount_today": float(bid_amount_today),
+            "bid_amount_week": float(bid_amount_week),
+            "is_running": is_running
+        }
+        
+    except Exception as e:
+        print(f"Error fetching autobid stats: {e}")
+        # Return zeros on error to not break UI
+        return {
+            "bids_today": 0,
+            "bids_week": 0,
+            "success_week": 0,
+            "failed_week": 0,
+            "bid_amount_today": 0.0,
+            "bid_amount_week": 0.0,
+            "is_running": False
+        }
 
 @app.post("/api/fetch-upwork")
 async def fetch_upwork(email: str = Depends(verify_token), db: Session = Depends(get_db)):
@@ -2187,6 +2306,8 @@ async def get_admin_analytics(
         from models import User, Lead
         from datetime import datetime, timedelta
         
+
+        
         # Parse time range
         days = 7
         if range == "30d":
@@ -2255,6 +2376,200 @@ async def get_admin_analytics(
         import traceback
         traceback.print_exc()
         raise HTTPException(status_code=500, detail=str(e))
+
+# AutoBidder Endpoints
+@app.get("/api/autobid/settings")
+async def get_autobid_settings(email: str = Depends(verify_token), db: Session = Depends(get_db)):
+    """Get current AutoBidder settings from database"""
+    from models import AutoBidSettings as DBAutoBidSettings
+    user = get_user_by_email(email, db)
+    
+    # Get settings from database or create default
+    db_settings = db.query(DBAutoBidSettings).filter(DBAutoBidSettings.user_id == user.id).first()
+    if not db_settings:
+        db_settings = DBAutoBidSettings(user_id=user.id)
+        db.add(db_settings)
+        db.commit()
+        db.refresh(db_settings)
+    
+    return {
+        "enabled": db_settings.enabled,
+        "min_budget": db_settings.min_budget,
+        "max_budget": db_settings.max_budget,
+        "frequency_minutes": db_settings.frequency_minutes,
+        "max_project_bids": db_settings.max_project_bids,
+        "smart_bidding": db_settings.smart_bidding
+    }
+
+@app.post("/api/autobid/settings")
+async def update_autobid_settings(
+    settings: AutoBidSettings,
+    email: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    """Update AutoBidder settings in database"""
+    from models import AutoBidSettings as DBAutoBidSettings
+    user = get_user_by_email(email, db)
+    
+    # Get or create settings
+    db_settings = db.query(DBAutoBidSettings).filter(DBAutoBidSettings.user_id == user.id).first()
+    if not db_settings:
+        db_settings = DBAutoBidSettings(user_id=user.id)
+        db.add(db_settings)
+    
+    # Update fields
+    if settings.enabled is not None:
+        db_settings.enabled = settings.enabled
+    if settings.min_budget is not None:
+        db_settings.min_budget = settings.min_budget
+    if settings.max_budget is not None:
+        db_settings.max_budget = settings.max_budget
+    if settings.frequency_minutes is not None:
+        db_settings.frequency_minutes = settings.frequency_minutes
+    if settings.max_project_bids is not None:
+        db_settings.max_project_bids = settings.max_project_bids
+    if settings.smart_bidding is not None:
+        db_settings.smart_bidding = settings.smart_bidding
+    
+    db.commit()
+    db.refresh(db_settings)
+    
+    # Update in-memory settings
+    settings_dict = {
+        "enabled": db_settings.enabled,
+        "min_budget": float(db_settings.min_budget),
+        "max_budget": float(db_settings.max_budget),
+        "frequency_minutes": db_settings.frequency_minutes,
+        "max_project_bids": db_settings.max_project_bids,
+        "smart_bidding": db_settings.smart_bidding
+    }
+    autobidder.update_settings(settings_dict)
+    
+    return settings_dict
+
+@app.post("/api/autobid/start")
+async def start_autobidder(email: str = Depends(verify_token), db: Session = Depends(get_db)):
+    """Manually start the AutoBidder service"""
+    try:
+        from models import AutoBidSettings as DBAutoBidSettings
+        
+        user = get_user_by_email(email, db)
+        
+        # Update database to mark as enabled
+        db_settings = db.query(DBAutoBidSettings).filter(DBAutoBidSettings.user_id == user.id).first()
+        if db_settings:
+            db_settings.enabled = True
+            db.commit()
+        
+        # Start the service
+        autobidder.start()
+        
+        return {
+            "success": True,
+            "status": "started", 
+            "message": "Auto-bidder started successfully",
+            "settings": autobidder.get_settings()
+        }
+    except Exception as e:
+        print(f"Error starting auto-bidder: {e}")
+        return {
+            "success": False,
+            "status": "error",
+            "message": f"Failed to start auto-bidder: {str(e)}"
+        }
+
+@app.post("/api/autobid/stop")
+async def stop_autobidder(email: str = Depends(verify_token), db: Session = Depends(get_db)):
+    """Manually stop the AutoBidder service"""
+    try:
+        from models import AutoBidSettings as DBAutoBidSettings
+        
+        user = get_user_by_email(email, db)
+        
+        # Update database to mark as disabled
+        db_settings = db.query(DBAutoBidSettings).filter(DBAutoBidSettings.user_id == user.id).first()
+        if db_settings:
+            db_settings.enabled = False
+            db.commit()
+        
+        # Stop the service
+        autobidder.stop()
+        
+        return {
+            "success": True,
+            "status": "stopped",
+            "message": "Auto-bidder stopped successfully"
+        }
+    except Exception as e:
+        print(f"Error stopping auto-bidder: {e}")
+        return {
+            "success": False,
+            "status": "error", 
+            "message": f"Failed to stop auto-bidder: {str(e)}"
+        }
+
+@app.post("/api/autobid/history")
+async def save_bid_history(bid_data: dict, db: Session = Depends(get_db)):
+    """Save bid history (called by autobidder)"""
+    from models import BidHistory
+    
+    # For now, use a default user_id (in production, extract from token)
+    user_id = 1  # TODO: Get from authenticated user
+    
+    history = BidHistory(
+        user_id=user_id,
+        project_id=bid_data.get("project_id"),
+        project_title=bid_data.get("project_title"),
+        project_url=bid_data.get("project_url"),
+        bid_amount=bid_data.get("bid_amount", 0),
+        proposal_text=bid_data.get("proposal_text"),
+        status=bid_data.get("status", "pending"),
+        error_message=bid_data.get("error_message")
+    )
+    
+    db.add(history)
+    db.commit()
+    return {"success": True}
+
+@app.get("/api/autobid/history")
+async def get_bid_history(
+    email: str = Depends(verify_token), 
+    db: Session = Depends(get_db),
+    limit: int = Query(10, ge=1, le=100),
+    offset: int = Query(0, ge=0)
+):
+    """Get bid history for current user with pagination"""
+    from models import BidHistory
+    user = get_user_by_email(email, db)
+    
+    # Get total count
+    total = db.query(BidHistory).filter(BidHistory.user_id == user.id).count()
+    
+    # Get paginated history
+    history = db.query(BidHistory).filter(
+        BidHistory.user_id == user.id
+    ).order_by(
+        BidHistory.created_at.desc()
+    ).offset(offset).limit(limit).all()
+    
+    return {
+        "history": [
+            {
+                "id": h.id,
+                "project_title": h.project_title,
+                "project_url": h.project_url,
+                "amount": h.bid_amount,
+                "bid_time": h.created_at.isoformat(),
+                "status": h.status,
+                "error": h.error_message,
+                "url": h.project_url
+            }
+            for h in history
+        ],
+        "total": total,
+        "limit": limit,
+        "offset": offset
+    }
 
 @app.get("/api/admin/leads")
 async def get_admin_leads(user = Depends(verify_admin), db: Session = Depends(get_db)):

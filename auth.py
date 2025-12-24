@@ -64,12 +64,6 @@ def verify_token(credentials: HTTPAuthorizationCredentials = Depends(security)):
             status_code=status.HTTP_401_UNAUTHORIZED,
             detail="Token has expired"
         )
-    except jwt.InvalidTokenError as e:
-        print(f"❌ [AUTH] Invalid token: {e}")
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail="Invalid token"
-        )
     except JWTError as e:
         print(f"❌ [AUTH] JWT Error: {e}")
         raise HTTPException(
