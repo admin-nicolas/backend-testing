@@ -235,18 +235,23 @@ class AutoBidder:
                     
                     user_response = await client.get(user_profile_url, headers=headers, cookies=cookies_dict)
                     
+                    logger.info(f"👤 User {user_id}: Profile API response: {user_response.status_code}")
+                    
                     user_skills = []
                     if user_response.status_code == 200:
                         user_data = user_response.json()
                         user_profile = user_data.get("result", {})
                         
+                        logger.info(f"👤 User {user_id}: Profile keys: {list(user_profile.keys()) if isinstance(user_profile, dict) else type(user_profile)}")
+                        
                         if user_profile.get("jobs") and len(user_profile["jobs"]) > 0:
                             user_skills = [job["id"] for job in user_profile["jobs"]]
-                            logger.info(f"✅ User {user_id}: Found {len(user_skills)} skills")
+                            logger.info(f"✅ User {user_id}: Found {len(user_skills)} skills: {user_skills[:5]}...")
                         else:
                             logger.info(f"ℹ️  User {user_id}: No skills found in user profile")
                     else:
                         logger.warning(f"⚠️  User {user_id}: Could not get user profile: {user_response.status_code}")
+                        logger.warning(f"⚠️  User {user_id}: Profile response: {user_response.text[:300]}...")
                     
                     # Step 2: Build URL with user skills
                     if user_skills:
@@ -254,6 +259,8 @@ class AutoBidder:
                         url = f"https://www.freelancer.com/api/projects/0.1/projects/active/?compact=true&limit=20&user_details=true&jobs=true&{skills_params}&languages[]=en"
                     else:
                         url = "https://www.freelancer.com/api/projects/0.1/projects/active/?compact=true&limit=20&user_details=true&jobs=true&user_recommended=true"
+                    
+                    logger.info(f"🌐 User {user_id}: Using URL: {url[:100]}...")
                     
                     # Step 3: Fetch projects
                     logger.info(f"📡 User {user_id}: Fetching projects...")
@@ -266,11 +273,45 @@ class AutoBidder:
                     
                     if response.status_code == 200:
                         data = response.json()
-                        projects = data.get("result", {}).get("projects", [])
+                        logger.info(f"🔍 User {user_id}: API Response structure: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+                        
+                        result = data.get("result", {})
+                        if isinstance(result, dict):
+                            projects = result.get("projects", [])
+                            logger.info(f"📊 User {user_id}: Result keys: {list(result.keys())}")
+                        else:
+                            projects = []
+                            logger.warning(f"⚠️  User {user_id}: Unexpected result format: {type(result)}")
+                        
                         logger.info(f"✅ User {user_id}: Successfully fetched {len(projects)} projects")
+                        
+                        # Log first project for debugging if available
+                        if projects and len(projects) > 0:
+                            first_project = projects[0]
+                            logger.info(f"📝 User {user_id}: Sample project keys: {list(first_project.keys()) if isinstance(first_project, dict) else type(first_project)}")
+                        
+                        # If no projects found with skills, try without skills filter
+                        if len(projects) == 0 and user_skills:
+                            logger.info(f"🔄 User {user_id}: No projects with skills filter, trying general search...")
+                            fallback_url = "https://www.freelancer.com/api/projects/0.1/projects/active/?compact=true&limit=20&user_details=true&jobs=true"
+                            
+                            fallback_response = await client.get(
+                                fallback_url,
+                                headers=headers,
+                                cookies=cookies_dict
+                            )
+                            
+                            if fallback_response.status_code == 200:
+                                fallback_data = fallback_response.json()
+                                fallback_result = fallback_data.get("result", {})
+                                if isinstance(fallback_result, dict):
+                                    projects = fallback_result.get("projects", [])
+                                    logger.info(f"🔄 User {user_id}: Fallback search found {len(projects)} projects")
+                        
                         return projects
                     else:
                         logger.error(f"❌ User {user_id}: Failed to fetch projects: HTTP {response.status_code}")
+                        logger.error(f"❌ User {user_id}: Response body: {response.text[:500]}...")
                         return []
                         
             finally:
@@ -371,13 +412,34 @@ class AutoBidder:
                         
                         if response.status_code == 200:
                             try:
+                                response_text = response.text
+                                logger.info(f"🔍 User {user_id}: Webhook response text: {response_text[:500]}...")
+                                
                                 data = response.json()
-                                proposal = data.get("data", {}).get("proposal") or data.get("proposal")
-                                if not proposal:
+                                logger.info(f"🔍 User {user_id}: Webhook response keys: {list(data.keys()) if isinstance(data, dict) else type(data)}")
+                                
+                                # Try multiple possible response formats
+                                proposal = None
+                                if isinstance(data, dict):
+                                    # Try different possible paths
+                                    proposal = (data.get("data", {}).get("proposal") or 
+                                              data.get("proposal") or 
+                                              data.get("result", {}).get("proposal") or
+                                              data.get("output") or  # Added for your webhook format
+                                              data.get("message") or
+                                              data.get("text"))
+                                elif isinstance(data, str):
+                                    proposal = data
+                                
+                                if not proposal or proposal.strip() == "":
+                                    logger.error(f"❌ User {user_id}: No proposal found in response structure: {data}")
                                     raise Exception("Empty proposal")
+                                    
                                 logger.info(f"✅ User {user_id}: AI Proposal Generated ({len(proposal)} chars)")
-                            except:
-                                raise Exception("Failed to parse AI proposal")
+                            except Exception as parse_error:
+                                logger.error(f"❌ User {user_id}: Parse error: {parse_error}")
+                                logger.error(f"❌ User {user_id}: Raw response: {response.text}")
+                                raise Exception(f"Failed to parse AI proposal: {parse_error}")
                         else:
                             raise Exception(f"AI failed: {response.status_code}")
                 except Exception as e:
