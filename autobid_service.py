@@ -348,8 +348,38 @@ class AutoBidder:
                                 if isinstance(fallback_result, dict):
                                     projects = fallback_result.get("projects", [])
                                     logger.info(f"🔄 User {user_id}: Fallback search found {len(projects)} projects")
+                            elif fallback_response.status_code == 401:
+                                logger.error(f"🔐 User {user_id}: Freelancer credentials EXPIRED (401) - user needs to refresh session")
+                                logger.error(f"🔐 User {user_id}: AutoBidder will skip this user until credentials are refreshed")
+                                return []
                         
                         return projects
+                    elif response.status_code == 401:
+                        logger.error(f"🔐 User {user_id}: Freelancer credentials EXPIRED (401) - user needs to refresh session")
+                        logger.error(f"🔐 User {user_id}: AutoBidder will skip this user until credentials are refreshed")
+                        logger.error(f"🔐 User {user_id}: User should open Freelancer.com in browser to refresh cookies")
+                        
+                        # Mark credentials as expired in database
+                        try:
+                            from database import SessionLocal
+                            from models import FreelancerCredentials
+                            
+                            db = SessionLocal()
+                            try:
+                                credentials = db.query(FreelancerCredentials).filter(
+                                    FreelancerCredentials.user_id == user_id
+                                ).first()
+                                
+                                if credentials:
+                                    credentials.is_validated = False  # Mark as invalid
+                                    db.commit()
+                                    logger.info(f"🔐 User {user_id}: Marked credentials as expired in database")
+                            finally:
+                                db.close()
+                        except Exception as e:
+                            logger.error(f"❌ Failed to update credential status: {e}")
+                        
+                        return []
                     else:
                         logger.error(f"❌ User {user_id}: Failed to fetch projects: HTTP {response.status_code}")
                         logger.error(f"❌ User {user_id}: Response body: {response.text[:500]}...")
@@ -618,6 +648,34 @@ class AutoBidder:
                     else:
                         error_text = bid_response.text
                         logger.error(f"❌ User {user_id}: Bid failed: {bid_response.status_code}")
+                        
+                        # Handle 401 Unauthorized (expired credentials) specially
+                        if bid_response.status_code == 401:
+                            logger.error(f"🔐 User {user_id}: Freelancer credentials EXPIRED (401) during bidding")
+                            logger.error(f"🔐 User {user_id}: User needs to refresh session by opening Freelancer.com in browser")
+                            logger.error(f"🔐 User {user_id}: AutoBidder will skip this user until credentials are refreshed")
+                            
+                            # Mark credentials as expired in database
+                            try:
+                                from database import SessionLocal
+                                from models import FreelancerCredentials
+                                
+                                db = SessionLocal()
+                                try:
+                                    credentials = db.query(FreelancerCredentials).filter(
+                                        FreelancerCredentials.user_id == user_id
+                                    ).first()
+                                    
+                                    if credentials:
+                                        credentials.is_validated = False  # Mark as invalid
+                                        db.commit()
+                                        logger.info(f"🔐 User {user_id}: Marked credentials as expired in database")
+                                finally:
+                                    db.close()
+                            except Exception as e:
+                                logger.error(f"❌ Failed to update credential status: {e}")
+                            
+                            return False
                         
                         try:
                             error_data = bid_response.json()
