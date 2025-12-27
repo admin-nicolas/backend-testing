@@ -100,29 +100,12 @@ def init_db():
 
 def get_db():
     """Database session optimized for Supabase transaction pooler"""
-    db = None
+    from database import SessionLocal
+    db = SessionLocal()
     try:
-        from database import SessionLocal
-        db = SessionLocal()
-        
-        # Optimize session for transaction pooler
-        db.execute(text("SET statement_timeout = '30s'"))
-        
         yield db
-    except Exception as e:
-        print(f"Database connection failed: {e}")
-        if db:
-            try:
-                db.rollback()
-            except:
-                pass  # Ignore rollback errors in transaction pooler
-        raise HTTPException(status_code=500, detail="Database connection failed")
     finally:
-        if db is not None:
-            try:
-                db.close()
-            except:
-                pass  # Ignore close errors in transaction pooler
+        db.close()
 
 def get_user_by_email(email: str, db: Session):
     """Helper function to get current user from email"""
@@ -1496,9 +1479,6 @@ async def signup(user_data: UserSignup, db: Session = Depends(get_db)):
 
 @app.post("/api/auth/login", response_model=Token)
 async def login(user_data: UserLogin, db: Session = Depends(get_db)):
-    if db is None:
-        raise HTTPException(status_code=500, detail="Database connection failed")
-    
     from models import User
     
     # Find user (case-insensitive email search)
@@ -1528,6 +1508,39 @@ async def debug_auth(request: Request):
         auth_header = request.headers.get("authorization")
         print(f"🔍 [DEBUG_AUTH] Authorization header: {auth_header}")
         
+        return {"status": "ok", "auth_header": auth_header}
+    except Exception as e:
+        print(f"Debug error: {e}")
+        return {"status": "error", "error": str(e)}
+
+@app.get("/api/debug/db")
+async def debug_db():
+    """Debug endpoint to check database connection"""
+    try:
+        from database import SessionLocal
+        from models import User
+        
+        db = SessionLocal()
+        
+        # Test basic connection
+        result = db.execute(text("SELECT 1 as test")).fetchone()
+        print(f"🔍 [DEBUG_DB] Basic query result: {result}")
+        
+        # Test user table
+        user_count = db.query(User).count()
+        print(f"🔍 [DEBUG_DB] User count: {user_count}")
+        
+        db.close()
+        
+        return {
+            "status": "ok", 
+            "basic_query": result[0] if result else None,
+            "user_count": user_count,
+            "database_url": os.getenv("DATABASE_URL", "Not set")[:50] + "..." if os.getenv("DATABASE_URL") else "Not set"
+        }
+    except Exception as e:
+        print(f"🔍 [DEBUG_DB] Database error: {e}")
+        return {"status": "error", "error": str(e)}
         if not auth_header:
             return {
                 "error": "No authorization header found",
