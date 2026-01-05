@@ -559,10 +559,21 @@ async def fetch_upwork(email: str = Depends(verify_token), db: Session = Depends
                 detail=f"Daily limit reached. You can fetch Upwork jobs {daily_limit} times per day. Limit resets at midnight UTC."
             )
         
-        # Get user's settings
+        # Get user's settings or create default ones
         settings = db.query(UserSettings).filter(UserSettings.user_id == user.id).first()
         if not settings:
-            raise HTTPException(status_code=400, detail="Load On server Plz try again Later")
+            # Create default settings for the user
+            settings = UserSettings(
+                user_id=user.id,
+                upwork_job_categories=["Web Development"],
+                upwork_max_jobs=3,
+                upwork_payment_verified=False,
+                freelancer_job_category="Web Development",
+                freelancer_max_jobs=3
+            )
+            db.add(settings)
+            db.commit()
+            db.refresh(settings)
         
         webhook_url = os.getenv("UPWORK_WEBHOOK_URL")
         if not webhook_url:
@@ -633,10 +644,21 @@ async def fetch_freelancer(email: str = Depends(verify_token), db: Session = Dep
                 detail=f"Daily limit reached. You can fetch Freelancer jobs {daily_limit} times per day. Limit resets at midnight UTC."
             )
         
-        # Get user's settings
+        # Get user's settings or create default ones
         settings = db.query(UserSettings).filter(UserSettings.user_id == user.id).first()
         if not settings:
-            raise HTTPException(status_code=400, detail="Load On server Plz try again Later")
+            # Create default settings for the user
+            settings = UserSettings(
+                user_id=user.id,
+                upwork_job_categories=["Web Development"],
+                upwork_max_jobs=3,
+                upwork_payment_verified=False,
+                freelancer_job_category="Web Development",
+                freelancer_max_jobs=3
+            )
+            db.add(settings)
+            db.commit()
+            db.refresh(settings)
         
         webhook_url = os.getenv("FREELANCER_WEBHOOK_URL")
         print(f"Triggering Freelancer webhook for user {user.email}: {webhook_url}")
@@ -733,10 +755,21 @@ async def fetch_freelancer_plus(email: str = Depends(verify_token), db: Session 
                 detail=f"Daily limit reached. You can fetch Freelancer Plus jobs {daily_limit} times per day. Limit resets at midnight UTC."
             )
         
-        # Get user's settings
+        # Get user's settings or create default ones
         settings = db.query(UserSettings).filter(UserSettings.user_id == user.id).first()
         if not settings:
-            raise HTTPException(status_code=400, detail="Load On server Plz try again Later")
+            # Create default settings for the user
+            settings = UserSettings(
+                user_id=user.id,
+                upwork_job_categories=["Web Development"],
+                upwork_max_jobs=3,
+                upwork_payment_verified=False,
+                freelancer_job_category="Web Development",
+                freelancer_max_jobs=3
+            )
+            db.add(settings)
+            db.commit()
+            db.refresh(settings)
         
         webhook_url = os.getenv("FREELANCER_PLUS_WEBHOOK_URL")
         print(f"Triggering Freelancer Plus webhook for user {user.email}: {webhook_url}")
