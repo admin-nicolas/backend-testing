@@ -2055,12 +2055,18 @@ async def get_admin_stats(user = Depends(verify_admin), db: Session = Depends(ge
         total_leads = db.query(Lead).count()
         
         # Auto-bidder statistics
-        auto_bid_enabled_count = db.query(AutoBidSettings).filter(AutoBidSettings.enabled == True).count()
-        auto_bid_disabled_count = db.query(AutoBidSettings).filter(AutoBidSettings.enabled == False).count()
+        # Count all users and their auto-bid status
+        total_users_count = db.query(User).count()
         
-        # Average bid frequency from auto_bid_settings
+        # Count users with auto-bidding enabled
+        auto_bid_enabled_count = db.query(AutoBidSettings).filter(AutoBidSettings.enabled == True).count()
+        
+        # Users without settings or with disabled settings are considered disabled
+        auto_bid_disabled_count = total_users_count - auto_bid_enabled_count
+        
+        # Average bid frequency from auto_bid_settings (only from existing settings)
         avg_frequency_result = db.query(db.func.avg(AutoBidSettings.frequency_minutes)).scalar()
-        avg_bid_frequency = round(avg_frequency_result, 1) if avg_frequency_result else 0
+        avg_bid_frequency = round(avg_frequency_result, 1) if avg_frequency_result else 10.0  # Default to 10 if no settings
         
         # Platform breakdown with revenue
         platform_counts = {}
