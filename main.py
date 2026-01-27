@@ -2047,6 +2047,7 @@ async def get_admin_stats(user = Depends(verify_admin), db: Session = Depends(ge
         
         from models import User, Lead, AutoBidSettings
         from datetime import datetime, timedelta
+        from sqlalchemy import func
         
         # Total users
         total_users = db.query(User).count()
@@ -2065,7 +2066,7 @@ async def get_admin_stats(user = Depends(verify_admin), db: Session = Depends(ge
         auto_bid_disabled_count = total_users_count - auto_bid_enabled_count
         
         # Average bid frequency from auto_bid_settings (only from existing settings)
-        avg_frequency_result = db.query(db.func.avg(AutoBidSettings.frequency_minutes)).scalar()
+        avg_frequency_result = db.query(func.avg(AutoBidSettings.frequency_minutes)).scalar()
         avg_bid_frequency = round(avg_frequency_result, 1) if avg_frequency_result else 10.0  # Default to 10 if no settings
         
         # Platform breakdown with revenue
