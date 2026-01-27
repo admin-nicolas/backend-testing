@@ -497,14 +497,9 @@ class AutoBidder:
             # 2. Filter projects by criteria for THIS user (including freshness check and skill matching)
             filtered_projects = self._filter_projects(projects_to_process, settings, user_selected_skills)
             
-            # If no projects found, try adaptive filtering (relaxed constraints)
-            if not filtered_projects:
-                logger.info(f"🔄 User {user_id}: No projects with strict filters, trying adaptive mode...")
-                filtered_projects = self._filter_projects(projects_to_process, settings, user_selected_skills, adaptive_mode=True)
-            
             if not filtered_projects:
                 min_skill_match = settings.get("min_skill_match", 1)
-                logger.info(f"🔍 User {user_id}: No projects match criteria even in adaptive mode")
+                logger.info(f"� UUser {user_id}: No projects match criteria (currencies: {settings.get('currencies', ['USD'])}, max bids: {settings.get('max_project_bids', 50)}, min skills: {min_skill_match}, max age: 10 minutes)")
                 return False
 
             min_skill_match = settings.get("min_skill_match", 1)
@@ -899,18 +894,13 @@ class AutoBidder:
         # Default fallback
         return "USD"
 
-    def _filter_projects(self, projects: List[Dict], settings: Dict, user_selected_skills: List[str] = None, adaptive_mode: bool = False) -> List[Dict]:
+    def _filter_projects(self, projects: List[Dict], settings: Dict, user_selected_skills: List[str] = None) -> List[Dict]:
         """Filter projects based on settings - focus on currency, freshness, and skill matching"""
         
         max_bids = settings.get("max_project_bids", 50)
         supported_currencies = settings.get("currencies", ["USD"])
         min_skill_match = settings.get("min_skill_match", 1)
-        
-        # Adaptive filtering - relax constraints if no projects found
-        max_age_minutes = 10 if not adaptive_mode else 30  # Extend to 30 minutes in adaptive mode
-        if adaptive_mode:
-            max_bids = max_bids * 2  # Allow more competitive projects
-            logger.info(f"🔄 ADAPTIVE MODE: Extended age to {max_age_minutes}m, max bids to {max_bids}")
+        max_age_minutes = 10  # Only bid on projects posted within last 10 minutes for freshness
         
         filtered = []
         import time
@@ -927,7 +917,7 @@ class AutoBidder:
             if project_currency not in supported_currencies:
                 continue
 
-            # 2. Check age - adaptive timing
+            # 2. Check age - only fresh projects (≤10 minutes)
             time_submitted = project.get("time_submitted", 0)
             if time_submitted > 0:
                 age_minutes = (current_timestamp - time_submitted) / 60
@@ -935,12 +925,12 @@ class AutoBidder:
                     continue
                 else:
                     posted_time = self._format_time_ago(time_submitted)
-                    logger.info(f"✅ {'Fresh' if age_minutes <= 10 else 'Recent'} project: {posted_time} - {project_currency}")
+                    logger.info(f"✅ Fresh project: {posted_time} - {project_currency}")
             else:
                 continue
 
-            # 3. Check skill matching (relaxed in adaptive mode)
-            if min_skill_match > 0 and not adaptive_mode:
+            # 3. Check skill matching - ALWAYS ENFORCED
+            if min_skill_match > 0:
                 project_skills = []
                 
                 # Extract skills from project data
@@ -1000,8 +990,6 @@ class AutoBidder:
                         continue
                     else:
                         logger.info(f"🎯 SKILL MATCH: {skill_match_count}/{min_skill_match}")
-            elif adaptive_mode:
-                logger.info(f"🔄 ADAPTIVE: Skipping skill matching for broader results")
 
             # 4. Check bid count
             bid_count = project.get("bid_stats", {}).get("bid_count", 0)
