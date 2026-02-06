@@ -161,3 +161,42 @@ class AutoBidSettings(BaseModel):
     smart_bidding: Optional[bool] = None
     min_skill_match: Optional[int] = None
     proposal_type: Optional[int] = None
+
+class ClosedDealCreate(BaseModel):
+    bid_history_id: Optional[int] = None
+    project_title: str
+    project_url: Optional[str] = None
+    platform: str
+    client_payment: float
+    outsource_cost: float
+    platform_fee: float
+    status: Optional[str] = "active"
+
+class ClosedDealUpdate(BaseModel):
+    project_title: Optional[str] = None
+    project_url: Optional[str] = None
+    client_payment: Optional[float] = None
+    outsource_cost: Optional[float] = None
+    platform_fee: Optional[float] = None
+    status: Optional[str] = None
+    completion_date: Optional[datetime] = None
+
+class ClosedDealResponse(BaseModel):
+    id: int
+    user_id: int
+    bid_history_id: Optional[int] = None
+    project_title: str
+    project_url: Optional[str] = None
+    platform: str
+    client_payment: float
+    outsource_cost: float
+    platform_fee: float
+    profit: float
+    status: str
+    closed_date: datetime
+    completion_date: Optional[datetime] = None
+    created_at: datetime
+    updated_at: datetime
+    
+    class Config:
+        from_attributes = True

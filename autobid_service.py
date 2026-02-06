@@ -1644,7 +1644,7 @@ class AutoBidder:
             # Step 0: Validate user has required skills for this project
             logger.info(f"🔍 User {user_id}: Validating skills for project...")
             if not await self._validate_user_skills_for_project(user_id, project):
-                logger.error(f"❌ User {user_id}: SKILL VALIDATION FAILED - User doesn't have required skills for this project")
+                logger.error(f"❌ User {user_id}: SKILL VALIDATION FAILED - Minimum skill match not met.")
                 
                 # Save to bid history to prevent retry
                 await self._save_bid_history({
@@ -1654,10 +1654,10 @@ class AutoBidder:
                     "project_url": f"https://www.freelancer.com/projects/{project.get('seo_url', project_id)}",
                     "bid_amount": 0,
                     "proposal_text": "Skill validation failed",
-                    "status": "skill_validation_failed",
-                    "error_message": "User doesn't have required skills for this project"
+                    "status": "insufficient_skill_match",
+                    "error_message": "Minimum skill match not met."
                 })
-                return "SKILL_VALIDATION_FAILED"
+                return "INSUFFICIENT_SKILL_MATCH"
             
             logger.info(f"✅ User {user_id}: Skill validation passed")
             

@@ -221,3 +221,34 @@ class AutoBidSettings(Base):
     
     # Relationship
     user = relationship("User")
+
+class ClosedDeal(Base):
+    __tablename__ = "closed_deals"
+
+    id = Column(Integer, primary_key=True, index=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    bid_history_id = Column(Integer, ForeignKey("bid_history.id"), nullable=True, index=True)  # Link to bid history
+    
+    # Project details
+    project_title = Column(String, nullable=False)
+    project_url = Column(String, nullable=True)
+    platform = Column(String, nullable=False)  # Upwork, Freelancer, etc.
+    
+    # Financial details
+    client_payment = Column(Float, nullable=False)  # Amount client pays
+    outsource_cost = Column(Float, nullable=False)  # Amount paid to freelancer
+    platform_fee = Column(Float, nullable=False)  # Platform fees (calculated)
+    profit = Column(Float, nullable=False)  # Net profit (calculated)
+    
+    # Status
+    status = Column(String, default="active")  # active, completed, cancelled
+    
+    # Dates
+    closed_date = Column(DateTime, default=datetime.utcnow)
+    completion_date = Column(DateTime, nullable=True)
+    created_at = Column(DateTime, default=datetime.utcnow)
+    updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+    
+    # Relationships
+    user = relationship("User")
+    bid_history = relationship("BidHistory")

@@ -1,7 +1,7 @@
 from fastapi import FastAPI, HTTPException, Depends, status, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
-from sqlalchemy import func, text, Float
+from sqlalchemy import func, text, Float, case
 from typing import List, Optional
 from datetime import datetime, timedelta
 import httpx
@@ -13,7 +13,7 @@ from concurrent.futures import ThreadPoolExecutor
 from cache_utils import cached, cleanup_cache
 import threading
 import time
-from schemas import UserSignup, UserLogin, Token, UserResponse, SettingsUpdate, SettingsResponse, UserProfileUpdate, TalentCreate, TalentUpdate, TalentResponse, FreelancerCredentialsCreate, FreelancerCredentialsResponse, FreelancerCredentialsUpdate, AutoBidSettings
+from schemas import UserSignup, UserLogin, Token, UserResponse, SettingsUpdate, SettingsResponse, UserProfileUpdate, TalentCreate, TalentUpdate, TalentResponse, FreelancerCredentialsCreate, FreelancerCredentialsResponse, FreelancerCredentialsUpdate, AutoBidSettings, ClosedDealCreate, ClosedDealUpdate, ClosedDealResponse
 from autobid_service import bidder as autobidder
 from auth import get_password_hash, verify_password, create_access_token, verify_token, SECRET_KEY, ALGORITHM
 import json
@@ -1205,7 +1205,7 @@ def get_dashboard_stats_cached(user_id: int, cache_key: str):
         timeline_stats = db.query(
             func.date(Lead.created_at).label('date'),
             func.count(Lead.id).label('total'),
-            func.sum(func.case([(Lead.status.in_(["AI Drafted", "Approved"]), 1)], else_=0)).label('proposals')
+            func.sum(case((Lead.status.in_(["AI Drafted", "Approved"]), 1), else_=0)).label('proposals')
         ).filter(
             Lead.user_id == user_id,
             Lead.visible == True,
@@ -5749,3 +5749,226 @@ async def send_message_with_cookies(
     except Exception as e:
         print(f"Error sending message: {e}")
         return {"success": False, "error": str(e)}
+
+# CRM Endpoints
+@app.get("/api/crm/deals")
+async def get_closed_deals(
+    email: str = Depends(verify_token),
+    db: Session = Depends(get_db),
+    limit: int = Query(50, ge=1, le=100),
+    offset: int = Query(0, ge=0)
+):
+    """Get all closed deals for current user"""
+    from models import ClosedDeal
+    user = get_user_by_email(email, db)
+    
+    # Get total count
+    total = db.query(ClosedDeal).filter(ClosedDeal.user_id == user.id).count()
+    
+    # Get paginated deals
+    deals = db.query(ClosedDeal).filter(
+        ClosedDeal.user_id == user.id
+    ).order_by(
+        ClosedDeal.closed_date.desc()
+    ).offset(offset).limit(limit).all()
+    
+    return {
+        "deals": [
+            {
+                "id": d.id,
+                "bid_history_id": d.bid_history_id,
+                "project_title": d.project_title,
+                "project_url": d.project_url,
+                "platform": d.platform,
+                "client_payment": d.client_payment,
+                "outsource_cost": d.outsource_cost,
+                "platform_fee": d.platform_fee,
+                "profit": d.profit,
+                "status": d.status,
+                "closed_date": d.closed_date.isoformat(),
+                "completion_date": d.completion_date.isoformat() if d.completion_date else None,
+                "created_at": d.created_at.isoformat(),
+                "updated_at": d.updated_at.isoformat()
+            }
+            for d in deals
+        ],
+        "total": total,
+        "limit": limit,
+        "offset": offset
+    }
+
+@app.post("/api/crm/deals")
+async def create_closed_deal(
+    deal_data: dict,
+    email: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    """Create a new closed deal"""
+    from models import ClosedDeal
+    user = get_user_by_email(email, db)
+    
+    # Calculate profit
+    client_payment = float(deal_data.get("client_payment", 0))
+    outsource_cost = float(deal_data.get("outsource_cost", 0))
+    platform_fee = float(deal_data.get("platform_fee", 0))
+    profit = client_payment - outsource_cost - platform_fee
+    
+    new_deal = ClosedDeal(
+        user_id=user.id,
+        bid_history_id=deal_data.get("bid_history_id"),
+        project_title=deal_data.get("project_title"),
+        project_url=deal_data.get("project_url"),
+        platform=deal_data.get("platform", "Unknown"),
+        client_payment=client_payment,
+        outsource_cost=outsource_cost,
+        platform_fee=platform_fee,
+        profit=profit,
+        status=deal_data.get("status", "active")
+    )
+    
+    db.add(new_deal)
+    db.commit()
+    db.refresh(new_deal)
+    
+    return {
+        "success": True,
+        "deal": {
+            "id": new_deal.id,
+            "bid_history_id": new_deal.bid_history_id,
+            "project_title": new_deal.project_title,
+            "project_url": new_deal.project_url,
+            "platform": new_deal.platform,
+            "client_payment": new_deal.client_payment,
+            "outsource_cost": new_deal.outsource_cost,
+            "platform_fee": new_deal.platform_fee,
+            "profit": new_deal.profit,
+            "status": new_deal.status,
+            "closed_date": new_deal.closed_date.isoformat(),
+            "completion_date": new_deal.completion_date.isoformat() if new_deal.completion_date else None
+        }
+    }
+
+@app.put("/api/crm/deals/{deal_id}")
+async def update_closed_deal(
+    deal_id: int,
+    deal_data: dict,
+    email: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    """Update an existing closed deal"""
+    from models import ClosedDeal
+    user = get_user_by_email(email, db)
+    
+    deal = db.query(ClosedDeal).filter(
+        ClosedDeal.id == deal_id,
+        ClosedDeal.user_id == user.id
+    ).first()
+    
+    if not deal:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    
+    # Update fields
+    if "project_title" in deal_data:
+        deal.project_title = deal_data["project_title"]
+    if "project_url" in deal_data:
+        deal.project_url = deal_data["project_url"]
+    if "client_payment" in deal_data:
+        deal.client_payment = float(deal_data["client_payment"])
+    if "outsource_cost" in deal_data:
+        deal.outsource_cost = float(deal_data["outsource_cost"])
+    if "platform_fee" in deal_data:
+        deal.platform_fee = float(deal_data["platform_fee"])
+    if "status" in deal_data:
+        deal.status = deal_data["status"]
+    if "completion_date" in deal_data:
+        if deal_data["completion_date"]:
+            deal.completion_date = datetime.fromisoformat(deal_data["completion_date"].replace('Z', '+00:00'))
+        else:
+            deal.completion_date = None
+    
+    # Recalculate profit
+    deal.profit = deal.client_payment - deal.outsource_cost - deal.platform_fee
+    deal.updated_at = datetime.utcnow()
+    
+    db.commit()
+    db.refresh(deal)
+    
+    return {
+        "success": True,
+        "deal": {
+            "id": deal.id,
+            "bid_history_id": deal.bid_history_id,
+            "project_title": deal.project_title,
+            "project_url": deal.project_url,
+            "platform": deal.platform,
+            "client_payment": deal.client_payment,
+            "outsource_cost": deal.outsource_cost,
+            "platform_fee": deal.platform_fee,
+            "profit": deal.profit,
+            "status": deal.status,
+            "closed_date": deal.closed_date.isoformat(),
+            "completion_date": deal.completion_date.isoformat() if deal.completion_date else None
+        }
+    }
+
+@app.delete("/api/crm/deals/{deal_id}")
+async def delete_closed_deal(
+    deal_id: int,
+    email: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    """Delete a closed deal"""
+    from models import ClosedDeal
+    user = get_user_by_email(email, db)
+    
+    deal = db.query(ClosedDeal).filter(
+        ClosedDeal.id == deal_id,
+        ClosedDeal.user_id == user.id
+    ).first()
+    
+    if not deal:
+        raise HTTPException(status_code=404, detail="Deal not found")
+    
+    db.delete(deal)
+    db.commit()
+    
+    return {"success": True, "message": "Deal deleted successfully"}
+
+@app.get("/api/crm/stats")
+async def get_crm_stats(
+    email: str = Depends(verify_token),
+    db: Session = Depends(get_db)
+):
+    """Get CRM statistics for dashboard"""
+    from models import ClosedDeal
+    user = get_user_by_email(email, db)
+    
+    # Total revenue (all closed deals)
+    total_revenue = db.query(func.sum(ClosedDeal.client_payment)).filter(
+        ClosedDeal.user_id == user.id,
+        ClosedDeal.status.in_(['active', 'completed'])
+    ).scalar() or 0
+    
+    # Total profit
+    total_profit = db.query(func.sum(ClosedDeal.profit)).filter(
+        ClosedDeal.user_id == user.id,
+        ClosedDeal.status.in_(['active', 'completed'])
+    ).scalar() or 0
+    
+    # Count of deals
+    total_deals = db.query(ClosedDeal).filter(
+        ClosedDeal.user_id == user.id
+    ).count()
+    
+    # Active deals
+    active_deals = db.query(ClosedDeal).filter(
+        ClosedDeal.user_id == user.id,
+        ClosedDeal.status == 'active'
+    ).count()
+    
+    return {
+        "total_revenue": float(total_revenue),
+        "total_profit": float(total_profit),
+        "total_deals": total_deals,
+        "active_deals": active_deals
+    }
