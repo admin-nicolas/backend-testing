@@ -2670,6 +2670,8 @@ async def update_autobid_settings(
         db_settings.min_skill_match = settings.min_skill_match
     if settings.proposal_type is not None:
         db_settings.proposal_type = settings.proposal_type
+    if settings.commission_projects is not None:
+        db_settings.commission_projects = settings.commission_projects
     
     db.commit()
     db.refresh(db_settings)
@@ -2683,7 +2685,8 @@ async def update_autobid_settings(
         "max_project_bids": db_settings.max_project_bids,
         "smart_bidding": db_settings.smart_bidding,
         "min_skill_match": db_settings.min_skill_match,
-        "proposal_type": db_settings.proposal_type
+        "proposal_type": db_settings.proposal_type,
+        "commission_projects": db_settings.commission_projects
     }
     autobidder.update_settings(settings_dict)
     

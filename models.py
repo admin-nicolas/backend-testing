@@ -215,6 +215,7 @@ class AutoBidSettings(Base):
     smart_bidding = Column(Boolean, default=True)  # Use average of min/max
     min_skill_match = Column(Integer, default=1)  # Minimum number of skills that must match
     proposal_type = Column(Integer, default=1)  # Proposal type: 1, 2, or 3
+    commission_projects = Column(Boolean, default=True)  # Include commission-based projects
     
     created_at = Column(DateTime, default=datetime.utcnow)
     updated_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)

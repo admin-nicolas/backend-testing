@@ -161,6 +161,7 @@ class AutoBidSettings(BaseModel):
     smart_bidding: Optional[bool] = None
     min_skill_match: Optional[int] = None
     proposal_type: Optional[int] = None
+    commission_projects: Optional[bool] = None
 
 class ClosedDealCreate(BaseModel):
     bid_history_id: Optional[int] = None

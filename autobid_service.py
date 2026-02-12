@@ -246,18 +246,21 @@ class AutoBidder:
         return False
 
     def _handle_user_failure(self, user_id: int):
-        """Handle consecutive failures with exponential backoff"""
+        """Handle consecutive failures with fixed 5-minute backoff"""
         current_time = datetime.now()
         retry_count = self._user_retry_count.get(user_id, 0) + 1
         self._user_retry_count[user_id] = retry_count
         
         if retry_count >= 3:  # After 3 consecutive failures
-            # Exponential backoff: 5min, 15min, 30min, 60min
-            backoff_minutes = min(60, 5 * (2 ** (retry_count - 3)))
+            # Fixed 5-minute backoff, then reset count
+            backoff_minutes = 5
             backoff_until = current_time + timedelta(minutes=backoff_minutes)
             self._user_backoff_until[user_id] = backoff_until
             
-            logger.warning(f"⏸️  User {user_id}: {retry_count} consecutive failures, backing off for {backoff_minutes}m")
+            # Reset retry count so it starts fresh after backoff
+            self._user_retry_count[user_id] = 0
+            
+            logger.warning(f"⏸️  User {user_id}: 3 consecutive failures, backing off for {backoff_minutes}m (count reset)")
         else:
             logger.info(f"⚠️  User {user_id}: Failure #{retry_count}, continuing normal operation")
 
@@ -312,7 +315,8 @@ class AutoBidder:
                             "frequency_minutes": db_setting.frequency_minutes,
                             "max_project_bids": db_setting.max_project_bids,
                             "smart_bidding": db_setting.smart_bidding,
-                            "min_skill_match": getattr(db_setting, 'min_skill_match', 1)
+                            "min_skill_match": getattr(db_setting, 'min_skill_match', 1),
+                            "commission_projects": getattr(db_setting, 'commission_projects', True)
                         }
                         
                         # Check if user should be skipped due to frequency limits
@@ -1236,6 +1240,17 @@ class AutoBidder:
                 filter_stats["age_rejected"] += 1
                 continue
 
+            # 2.5. Check commission projects setting
+            commission_projects_enabled = settings.get("commission_projects", True)
+            if not commission_projects_enabled:
+                # Check if "Commission" appears in the project title
+                if "commission" in project_title.lower():
+                    logger.info(f"⏭️  Skipping commission project (found 'Commission' in title): {project_title}")
+                    if "commission_rejected" not in filter_stats:
+                        filter_stats["commission_rejected"] = 0
+                    filter_stats["commission_rejected"] += 1
+                    continue
+
             # 3. Check skill matching - ENHANCED VERSION
             if min_skill_match > 0:
                 # Use enhanced skill extraction
@@ -1309,6 +1324,8 @@ class AutoBidder:
         logger.info(f"   ✅ Passed all filters: {filter_stats['passed']}")
         logger.info(f"   💰 Currency rejected: {filter_stats['currency_rejected']}")
         logger.info(f"   ⏰ Age rejected (>15min): {filter_stats['age_rejected']}")
+        if filter_stats.get('commission_rejected', 0) > 0:
+            logger.info(f"   💼 Commission rejected: {filter_stats['commission_rejected']}")
         logger.info(f"   🎯 Skill rejected (<{min_skill_match} or <50%): {filter_stats['skill_rejected']}")
         logger.info(f"   📈 Bid count rejected (>{max_bids}): {filter_stats['bid_count_rejected']}")
         
