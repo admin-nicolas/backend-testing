@@ -1658,25 +1658,27 @@ class AutoBidder:
             title = project.get("title", "Unknown")
             project_id = project.get("id")
             
-            # Step 0: Validate user has required skills for this project
-            logger.info(f"🔍 User {user_id}: Validating skills for project...")
-            if not await self._validate_user_skills_for_project(user_id, project):
-                logger.error(f"❌ User {user_id}: SKILL VALIDATION FAILED - Minimum skill match not met.")
-                
-                # Save to bid history to prevent retry
-                await self._save_bid_history({
-                    "user_id": user_id,
-                    "project_id": str(project_id),
-                    "project_title": title,
-                    "project_url": f"https://www.freelancer.com/projects/{project.get('seo_url', project_id)}",
-                    "bid_amount": 0,
-                    "proposal_text": "Skill validation failed",
-                    "status": "insufficient_skill_match",
-                    "error_message": "Minimum skill match not met."
-                })
-                return "INSUFFICIENT_SKILL_MATCH"
-            
-            logger.info(f"✅ User {user_id}: Skill validation passed")
+            # Step 0: Skill validation is now handled in _filter_projects() 
+            # This redundant ID-based validation was too strict and caused false rejections
+            # The name-based skill matching in _filter_projects is more accurate
+            # logger.info(f"🔍 User {user_id}: Validating skills for project...")
+            # if not await self._validate_user_skills_for_project(user_id, project):
+            #     logger.error(f"❌ User {user_id}: SKILL VALIDATION FAILED - Minimum skill match not met.")
+            #     
+            #     # Save to bid history to prevent retry
+            #     await self._save_bid_history({
+            #         "user_id": user_id,
+            #         "project_id": str(project_id),
+            #         "project_title": title,
+            #         "project_url": f"https://www.freelancer.com/projects/{project.get('seo_url', project_id)}",
+            #         "bid_amount": 0,
+            #         "proposal_text": "Skill validation failed",
+            #         "status": "insufficient_skill_match",
+            #         "error_message": "Minimum skill match not met."
+            #     })
+            #     return "INSUFFICIENT_SKILL_MATCH"
+            # 
+            # logger.info(f"✅ User {user_id}: Skill validation passed")
             
             # Calculate bid amount FIRST
             budget = project.get("budget", {})
