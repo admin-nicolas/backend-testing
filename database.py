@@ -22,7 +22,7 @@ engine = create_engine(
     connect_args={
         "connect_timeout": 3,  # Very fast connection timeout for pooler
         "application_name": "akbpo_backend",
-        "options": "-c default_transaction_isolation=read_committed -c statement_timeout=30s"
+        "options": "-c statement_timeout=30s"
     }
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
