@@ -201,3 +201,25 @@ class ClosedDealResponse(BaseModel):
     
     class Config:
         from_attributes = True
+
+# ----- Extracted Requests -----
+class BidRequest(BaseModel):
+    access_token: str
+    project_id: int
+    bidder_id: int
+    amount: float
+    period: int = 7
+    description: str
+    milestone_percentage: int = 100
+    freelancer_cookies: Optional[str] = None
+
+class ProjectsRequest(BaseModel):
+    access_token: str
+    limit: int = 20
+    freelancer_cookies: Optional[str] = None
+
+class MessageRequest(BaseModel):
+    thread_id: int
+    message: str
+    access_token: str
+    freelancer_cookies: Optional[str] = None
