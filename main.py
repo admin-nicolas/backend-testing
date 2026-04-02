@@ -61,47 +61,9 @@ app.include_router(guru_router)
 @app.on_event("startup")
 async def startup_event():
     start_cache_cleanup()
-    
-    # Load auto-bidder settings from database and start if enabled
-    try:
-        from database import SessionLocal
-        from models import AutoBidSettings as DBAutoBidSettings
-        
-        db = SessionLocal()
-        try:
-            # Get first user's settings (or any enabled settings)
-            db_settings = db.query(DBAutoBidSettings).filter(
-                DBAutoBidSettings.enabled == True
-            ).first()
-            
-            if db_settings:
-                print(f"🚀 Loading auto-bidder settings for user {db_settings.user_id}")
-                
-                # Update in-memory settings
-                settings_dict = {
-                    "enabled": db_settings.enabled,
-                    "daily_bids": db_settings.daily_bids,
-                    "currencies": db_settings.currencies,
-                    "frequency_minutes": db_settings.frequency_minutes,
-                    "max_project_bids": db_settings.max_project_bids,
-                    "smart_bidding": db_settings.smart_bidding,
-                    "min_skill_match": getattr(db_settings, 'min_skill_match', 1),
-                    "proposal_type": getattr(db_settings, 'proposal_type', 1)
-                }
-                autobidder.update_settings(settings_dict)
-                
-                # Explicitly start the service since we found enabled users
-                autobidder.start()
-                
-                print(f"✅ Auto-bidder starting automatically (enabled in database)")
-                print(f"   Settings: Daily bids: {settings_dict['daily_bids']}, Currencies: {settings_dict['currencies']}, Frequency: {settings_dict['frequency_minutes']}min")
-            else:
-                print("ℹ️  Auto-bidder not enabled in database, staying off")
-        finally:
-            db.close()
-    except Exception as e:
-        print(f"⚠️  Error loading auto-bidder settings: {e}")
-        # Continue without auto-bidder if there's an error
+    # Auto-bidder settings are now loaded lazily when the first bid fires,
+    # avoiding a DB hit on every cold start (which happens every few minutes on Vercel).
+    print("✅ AK BPO backend started")
 
 @app.on_event("shutdown")
 async def shutdown_event():

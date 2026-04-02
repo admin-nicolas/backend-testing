@@ -8,20 +8,21 @@ load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
-# Optimized for Supabase - Performance Tuned
+# Serverless-optimised for Vercel + Supabase pooler (port 6543)
+# Low pool_size prevents connection exhaustion when many Vercel instances run concurrently
 engine = create_engine(
     DATABASE_URL,
-    pool_pre_ping=True,  # Check connection health before using
-    pool_recycle=1800,  # Recycle connections every 30 minutes
-    pool_size=10,  # Increased pool size for better concurrency
-    max_overflow=20,  # Allow more overflow connections
-    pool_timeout=10,  # Reduced timeout for faster failures
-    echo=False,  # Disable SQL logging for performance
-    future=True,  # Use SQLAlchemy 2.0 style
+    pool_pre_ping=True,     # Drop stale connections before use
+    pool_recycle=300,       # 5 min — short recycle suits serverless lifetimes
+    pool_size=2,            # 2 per instance; Vercel spins many instances
+    max_overflow=5,         # Max 7 total per instance
+    pool_timeout=30,        # Wait up to 30s to acquire a connection
+    echo=False,
+    future=True,
     connect_args={
-        "connect_timeout": 5,  # Faster connection timeout
+        "connect_timeout": 10,
         "application_name": "akbpo_backend",
-        "options": "-c statement_timeout=10s"  # Reduced from 30s to 10s
+        "options": "-c statement_timeout=30s"
     }
 )
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

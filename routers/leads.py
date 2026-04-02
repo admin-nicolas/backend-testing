@@ -398,42 +398,33 @@ async def get_admin_stats(user = Depends(verify_admin), db: Session = Depends(ge
         avg_frequency_result = db.query(func.avg(AutoBidSettings.frequency_minutes)).scalar()
         avg_bid_frequency = round(avg_frequency_result, 1) if avg_frequency_result else 10.0  # Default to 10 if no settings
         
-        # Platform breakdown with revenue
-        platform_counts = {}
-        platform_revenue = {}
-        all_leads = db.query(Lead).all()
-        
-        # Calculate total revenue and proposal success rate
-        total_revenue = 0
-        total_proposals_sent = 0
-        total_proposals_accepted = 0
-        
-        for lead in all_leads:
-            platform = lead.platform or "Unknown"
-            platform_counts[platform] = platform_counts.get(platform, 0) + 1
-            
-            # Track revenue per platform
-            lead_revenue = getattr(lead, 'revenue', 0) or 0
-            platform_revenue[platform] = platform_revenue.get(platform, 0) + lead_revenue
-            total_revenue += lead_revenue
-            
-            # Track proposal success
-            if getattr(lead, 'proposal_sent', False):
-                total_proposals_sent += 1
-                if getattr(lead, 'proposal_accepted', False):
-                    total_proposals_accepted += 1
-        
-        total_with_platform = sum(platform_counts.values())
+        # Platform breakdown — single SQL aggregation, no full table scan
+        platform_rows = db.query(
+            Lead.platform,
+            func.count(Lead.id).label('cnt'),
+            func.coalesce(func.sum(Lead.revenue), 0).label('revenue'),
+            func.count(case((Lead.proposal_sent == True, 1), else_=None)).label('proposals_sent'),
+            func.count(case(
+                ((Lead.proposal_sent == True) & (Lead.proposal_accepted == True), 1),
+                else_=None
+            )).label('proposals_accepted'),
+        ).group_by(Lead.platform).all()
+
+        total_with_platform = sum(r.cnt for r in platform_rows)
+        total_revenue = sum(float(r.revenue or 0) for r in platform_rows)
+        total_proposals_sent = sum(r.proposals_sent for r in platform_rows)
+        total_proposals_accepted = sum(r.proposals_accepted for r in platform_rows)
+
         platform_breakdown = [
             {
-                "name": platform,
-                "count": count,
-                "percentage": round((count / total_with_platform * 100), 1) if total_with_platform > 0 else 0,
-                "revenue": platform_revenue.get(platform, 0)
+                "name": r.platform or "Unknown",
+                "count": r.cnt,
+                "percentage": round((r.cnt / total_with_platform * 100), 1) if total_with_platform > 0 else 0,
+                "revenue": float(r.revenue or 0)
             }
-            for platform, count in platform_counts.items()
+            for r in platform_rows
         ]
-        
+
         # Calculate success rate
         success_rate = round((total_proposals_accepted / total_proposals_sent * 100), 1) if total_proposals_sent > 0 else 0
         
@@ -466,55 +457,51 @@ async def get_all_users(user = Depends(verify_admin), db: Session = Depends(get_
         from datetime import datetime, timedelta
         
         all_users = db.query(User).all()
-        users_data = []
-        
+        user_ids = [u.id for u in all_users]
+
         # Calculate date ranges
         today = datetime.utcnow().date()
-        week_ago = today - timedelta(days=7)
-        
+        today_dt = datetime.combine(today, datetime.min.time())
+        week_ago_dt = today_dt - timedelta(days=7)
+
+        # Batch leads stats — one query for all users
+        leads_rows = db.query(
+            Lead.user_id,
+            func.count(Lead.id).label('total'),
+            func.count(case((Lead.proposal_accepted == True, 1), else_=None)).label('approved')
+        ).filter(Lead.user_id.in_(user_ids)).group_by(Lead.user_id).all()
+        leads_map = {r.user_id: r for r in leads_rows}
+
+        # Batch bid history stats — one query for all users
+        bid_rows = db.query(
+            BidHistory.user_id,
+            func.count(case((BidHistory.created_at >= today_dt, 1), else_=None)).label('bids_today'),
+            func.count(case((BidHistory.created_at >= week_ago_dt, 1), else_=None)).label('bids_week'),
+            func.count(case(
+                ((BidHistory.created_at >= today_dt) & (BidHistory.status == 'success'), 1),
+                else_=None
+            )).label('success_today'),
+            func.count(case(
+                ((BidHistory.created_at >= week_ago_dt) & (BidHistory.status == 'success'), 1),
+                else_=None
+            )).label('success_week'),
+        ).filter(BidHistory.user_id.in_(user_ids)).group_by(BidHistory.user_id).all()
+        bid_map = {r.user_id: r for r in bid_rows}
+
+        # Batch profit stats — one query for all users
+        profit_rows = db.query(
+            ClosedDeal.user_id,
+            func.coalesce(func.sum(ClosedDeal.profit), 0).label('total_profit')
+        ).filter(
+            ClosedDeal.user_id.in_(user_ids),
+            ClosedDeal.status.in_(['active', 'completed'])
+        ).group_by(ClosedDeal.user_id).all()
+        profit_map = {r.user_id: float(r.total_profit) for r in profit_rows}
+
+        users_data = []
         for u in all_users:
-            # Count total leads for this user
-            leads_count = db.query(Lead).filter(Lead.user_id == u.id).count()
-            
-            # Count approved leads (proposal_accepted = True)
-            approved_leads_count = db.query(Lead).filter(
-                Lead.user_id == u.id,
-                Lead.proposal_accepted == True
-            ).count()
-            
-            # Auto-bid statistics from bid_history
-            # Bids today
-            bids_today = db.query(BidHistory).filter(
-                BidHistory.user_id == u.id,
-                BidHistory.created_at >= datetime.combine(today, datetime.min.time())
-            ).count()
-            
-            # Bids this week
-            bids_week = db.query(BidHistory).filter(
-                BidHistory.user_id == u.id,
-                BidHistory.created_at >= datetime.combine(week_ago, datetime.min.time())
-            ).count()
-            
-            # Success today
-            success_today = db.query(BidHistory).filter(
-                BidHistory.user_id == u.id,
-                BidHistory.created_at >= datetime.combine(today, datetime.min.time()),
-                BidHistory.status == 'success'
-            ).count()
-            
-            # Success this week
-            success_week = db.query(BidHistory).filter(
-                BidHistory.user_id == u.id,
-                BidHistory.created_at >= datetime.combine(week_ago, datetime.min.time()),
-                BidHistory.status == 'success'
-            ).count()
-            
-            # Profit from CRM (closed deals)
-            total_profit = db.query(func.sum(ClosedDeal.profit)).filter(
-                ClosedDeal.user_id == u.id,
-                ClosedDeal.status.in_(['active', 'completed'])
-            ).scalar() or 0
-            
+            l = leads_map.get(u.id)
+            b = bid_map.get(u.id)
             users_data.append({
                 "id": u.id,
                 "email": u.email,
@@ -523,16 +510,16 @@ async def get_all_users(user = Depends(verify_admin), db: Session = Depends(get_
                 "upwork_fetch_count": u.upwork_fetch_count or 0,
                 "freelancer_fetch_count": u.freelancer_fetch_count or 0,
                 "freelancer_plus_fetch_count": u.freelancer_plus_fetch_count or 0,
-                "leads_count": leads_count,
-                "approved_leads_count": approved_leads_count,
-                "bids_today": bids_today,
-                "bids_week": bids_week,
-                "success_today": success_today,
-                "success_week": success_week,
-                "total_profit": float(total_profit),
+                "leads_count": l.total if l else 0,
+                "approved_leads_count": l.approved if l else 0,
+                "bids_today": b.bids_today if b else 0,
+                "bids_week": b.bids_week if b else 0,
+                "success_today": b.success_today if b else 0,
+                "success_week": b.success_week if b else 0,
+                "total_profit": profit_map.get(u.id, 0.0),
                 "created_at": u.created_at.isoformat() if u.created_at else None
             })
-        
+
         return {"users": users_data}
     except Exception as e:
         print(f"Error fetching users: {e}")

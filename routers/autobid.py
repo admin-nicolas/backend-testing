@@ -33,68 +33,61 @@ async def autobid_heartbeat():
 async def get_autobid_stats(email: str = Depends(verify_token), db: Session = Depends(get_db)):
     try:
         from models import BidHistory, AutoBidSettings
-        
+
         user = get_user_by_email(email, db)
-        
+
         now = datetime.utcnow()
         today_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
-        week_start = today_start - timedelta(days=today_start.weekday())  # Start of week (Monday)
-        
-        # 1. Bids Today
-        bids_today = db.query(BidHistory).filter(
-            BidHistory.user_id == user.id,
-            BidHistory.created_at >= today_start
-        ).count()
-        
-        # 2. Bids This Week
-        bids_week = db.query(BidHistory).filter(
-            BidHistory.user_id == user.id,
-            BidHistory.created_at >= week_start
-        ).count()
-        
-        # 3. Success Bids Week
-        success_week = db.query(BidHistory).filter(
-            BidHistory.user_id == user.id,
-            BidHistory.created_at >= week_start,
-            func.lower(BidHistory.status).in_(['success', 'accepted', 'awarded'])
-        ).count()
-        
-        # 4. Failed Bids Week
-        failed_week = db.query(BidHistory).filter(
-            BidHistory.user_id == user.id,
-            BidHistory.created_at >= week_start,
-            func.lower(BidHistory.status).in_(['failed', 'rejected', 'declined', 'error'])
-        ).count()
-        
-        # 5. Bid Amount Today
-        bid_amount_today = db.query(func.sum(BidHistory.bid_amount)).filter(
-            BidHistory.user_id == user.id,
-            BidHistory.created_at >= today_start
-        ).scalar() or 0
-        
-        # 6. Bid Amount This Week
-        bid_amount_week = db.query(func.sum(BidHistory.bid_amount)).filter(
-            BidHistory.user_id == user.id,
-            BidHistory.created_at >= week_start
-        ).scalar() or 0
-        
-        # 7. Auto-Bidder Status
-        settings = db.query(AutoBidSettings).filter(AutoBidSettings.user_id == user.id).first()
+        week_start = today_start - timedelta(days=today_start.weekday())
+
+        # Single aggregation query — replaces 6 separate DB round-trips
+        row = db.query(
+            func.count(
+                case((BidHistory.created_at >= today_start, 1), else_=None)
+            ).label('bids_today'),
+            func.count(
+                case((BidHistory.created_at >= week_start, 1), else_=None)
+            ).label('bids_week'),
+            func.count(
+                case((
+                    (BidHistory.created_at >= week_start) &
+                    func.lower(BidHistory.status).in_(['success', 'accepted', 'awarded']),
+                    1
+                ), else_=None)
+            ).label('success_week'),
+            func.count(
+                case((
+                    (BidHistory.created_at >= week_start) &
+                    func.lower(BidHistory.status).in_(['failed', 'rejected', 'declined', 'error']),
+                    1
+                ), else_=None)
+            ).label('failed_week'),
+            func.coalesce(
+                func.sum(case((BidHistory.created_at >= today_start, BidHistory.bid_amount), else_=None)),
+                0
+            ).label('amount_today'),
+            func.coalesce(
+                func.sum(case((BidHistory.created_at >= week_start, BidHistory.bid_amount), else_=None)),
+                0
+            ).label('amount_week'),
+        ).filter(BidHistory.user_id == user.id).first()
+
+        # Separate small query for settings (different table, unavoidable)
+        settings = db.query(AutoBidSettings.enabled).filter(AutoBidSettings.user_id == user.id).first()
         is_running = settings.enabled if settings else False
-        
+
         return {
-            "bids_today": bids_today,
-            "bids_week": bids_week,
-            "success_week": success_week,
-            "failed_week": failed_week,
-            "bid_amount_today": float(bid_amount_today),
-            "bid_amount_week": float(bid_amount_week),
+            "bids_today": row.bids_today or 0,
+            "bids_week": row.bids_week or 0,
+            "success_week": row.success_week or 0,
+            "failed_week": row.failed_week or 0,
+            "bid_amount_today": float(row.amount_today or 0),
+            "bid_amount_week": float(row.amount_week or 0),
             "is_running": is_running
         }
-        
+
     except Exception as e:
         print(f"Error fetching autobid stats: {e}")
-        # Return zeros on error to not break UI
         return {
             "bids_today": 0,
             "bids_week": 0,
