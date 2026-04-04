@@ -7,7 +7,6 @@ import httpx
 import os
 import re
 import json
-import secrets
 from urllib.parse import unquote
 import time
 
@@ -90,76 +89,6 @@ async def get_current_user(email: str = Depends(verify_token), db: Session = Dep
         raise HTTPException(status_code=404, detail="User not found")
     
     return user
-
-@router.post("/api/auth/forgot-password")
-async def forgot_password(request: Request, db: Session = Depends(get_db)):
-    body = await request.json()
-    email = body.get("email", "").lower().strip()
-
-    # Always return success — never reveal if email exists
-    if not email:
-        return {"success": True}
-
-    from models import User
-    import resend
-
-    resend.api_key = os.environ.get("RESEND_API_KEY", "")
-
-    user = db.query(User).filter(func.lower(User.email) == email).first()
-    if user:
-        token = secrets.token_urlsafe(32)
-        user.reset_token = token
-        user.reset_token_expires = datetime.utcnow() + timedelta(hours=1)
-        db.commit()
-
-        reset_url = f"https://akdropservicing.netlify.app/reset-password?token={token}"
-
-        resend.Emails.send({
-            "from": "onboarding@resend.dev",
-            "to": user.email,
-            "subject": "Reset your AK BPO password",
-            "html": f"""
-                <div style="font-family: Arial, sans-serif; max-width: 500px; margin: 0 auto;">
-                    <h2 style="color: #333;">Reset your password</h2>
-                    <p>Hi {user.name or 'there'},</p>
-                    <p>We received a request to reset your AK BPO account password. Click the button below to set a new password.</p>
-                    <a href="{reset_url}" style="display:inline-block;margin:20px 0;padding:12px 24px;background:#4f46e5;color:#fff;text-decoration:none;border-radius:6px;font-weight:bold;">Reset Password</a>
-                    <p style="color:#666;font-size:13px;">This link expires in 1 hour. If you didn't request a password reset, you can safely ignore this email.</p>
-                    <hr style="border:none;border-top:1px solid #eee;margin:20px 0;">
-                    <p style="color:#999;font-size:12px;">AK BPO · akdropservicing.netlify.app</p>
-                </div>
-            """
-        })
-
-    return {"success": True}
-
-
-@router.post("/api/auth/reset-password")
-async def reset_password(request: Request, db: Session = Depends(get_db)):
-    body = await request.json()
-    token = body.get("token", "").strip()
-    new_password = body.get("new_password", "").strip()
-
-    if not token or not new_password:
-        raise HTTPException(status_code=400, detail="Token and new password are required")
-
-    from models import User
-
-    user = db.query(User).filter(
-        User.reset_token == token,
-        User.reset_token_expires > datetime.utcnow()
-    ).first()
-
-    if not user:
-        raise HTTPException(status_code=400, detail="Invalid or expired reset link")
-
-    user.hashed_password = get_password_hash(new_password)
-    user.reset_token = None
-    user.reset_token_expires = None
-    db.commit()
-
-    return {"success": True, "message": "Password updated"}
-
 
 @router.post("/api/user/info")
 async def get_user_info(request: ProjectsRequest):
