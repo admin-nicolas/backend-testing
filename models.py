@@ -43,6 +43,10 @@ class User(Base):
     telegram_chat_id = Column(String, nullable=True)  # Telegram chat ID for notifications
     country = Column(String, nullable=True)  # User's country
     
+    # Password reset
+    reset_token = Column(String, unique=True, nullable=True)
+    reset_token_expires = Column(DateTime, nullable=True)
+
     # Daily fetch limits
     upwork_fetch_count = Column(Integer, default=0)  # Daily fetch count for Upwork
     upwork_last_reset = Column(DateTime, nullable=True)  # Last time the counter was reset
