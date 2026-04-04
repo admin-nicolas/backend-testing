@@ -31,6 +31,11 @@ app = FastAPI()
 async def test_server():
     return {"status": "ok", "message": "Backend is running and accessible"}
 
+@app.get("/api/routes")
+async def list_routes():
+    url_list = [{"path": route.path, "name": route.name, "methods": list(route.methods) if hasattr(route, "methods") else []} for route in app.routes]
+    return {"total": len(url_list), "routes": url_list}
+
 # Move CORS to the top to ensure it wraps all routes and handlers
 # When allow_credentials=True, allow_origins cannot be ["*"]
 origins = [
