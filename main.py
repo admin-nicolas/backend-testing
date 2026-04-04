@@ -77,12 +77,23 @@ async def shutdown_event():
 
 
 
+# Define allowed origins for CORS
+# When allow_credentials=True, allow_origins cannot be ["*"]
+origins = [
+    "https://akdropservicing.netlify.app",
+    "https://akindustries.qubeknit.com", # Add other possible frontend domains
+    "http://localhost:5173",
+    "http://localhost:3000",
+    "http://localhost:8000",
+]
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
+    allow_origins=origins,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["*"],
 )
 
 # Add performance middleware
