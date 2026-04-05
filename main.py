@@ -1,5 +1,6 @@
 from pydantic import BaseModel
 from fastapi import FastAPI, HTTPException, Depends, status, Query, Request
+from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy.orm import Session
 from sqlalchemy import func, text, Float, case
@@ -27,16 +28,9 @@ load_dotenv()
 
 app = FastAPI()
 
-@app.get("/api/test-server")
-async def test_server():
-    return {"status": "ok", "message": "Backend is running and accessible"}
+# --- MIDDLEWARE (OUTERMOST FIRST) ---
 
-@app.get("/api/routes")
-async def list_routes():
-    url_list = [{"path": route.path, "name": route.name, "methods": list(route.methods) if hasattr(route, "methods") else []} for route in app.routes]
-    return {"total": len(url_list), "routes": url_list}
-
-# Move CORS to the top to ensure it wraps all routes and handlers
+# 1. CORS Middleware - MUST BE FIRST to catch preflight (OPTIONS) requests correctly
 # When allow_credentials=True, allow_origins cannot be ["*"]
 origins = [
     "https://akdropservicing.netlify.app",
@@ -58,19 +52,45 @@ app.add_middleware(
     expose_headers=["*"],
 )
 
+@app.get("/api/test-server")
+async def test_server():
+    return {"status": "ok", "message": "Backend is running and accessible"}
+
+@app.get("/api/routes")
+async def list_routes():
+    url_list = [{"path": route.path, "name": route.name, "methods": list(route.methods) if hasattr(route, "methods") else []} for route in app.routes]
+    return {"total": len(url_list), "routes": url_list}
+
 # Global exception handler to capture and return more detailed errors for debugging
 @app.exception_handler(Exception)
 async def global_exception_handler(request: Request, exc: Exception):
-    print(f"🔥 UNCAUGHT EXCEPTION: {str(exc)}")
+    error_msg = str(exc)
+    print(f"🔥 UNCAUGHT EXTERNAL EXCEPTION: {error_msg}")
     import traceback
     traceback.print_exc()
+    
+    # Manually add CORS headers to error response if middleware hasn't added them
+    origin = request.headers.get("origin")
+    headers = {}
+    if origin in origins:
+        headers["Access-Control-Allow-Origin"] = origin
+        headers["Access-Control-Allow-Credentials"] = "true"
+    elif origin and (origin.startswith("chrome-extension://") or "netlify.app" in origin):
+        headers["Access-Control-Allow-Origin"] = origin
+        headers["Access-Control-Allow-Credentials"] = "true"
+
     return JSONResponse(
         status_code=500,
-        content={"detail": "Internal Server Error", "error": str(exc)},
+        content={
+            "detail": "Internal Server Error", 
+            "error": error_msg,
+            "type": type(exc).__name__,
+            "path": request.url.path
+        },
+        headers=headers
     )
 
 from fastapi.responses import JSONResponse
-
 
 from routers.leads import router as leads_router
 app.include_router(leads_router)

@@ -8,6 +8,12 @@ load_dotenv()
 
 DATABASE_URL = os.getenv("DATABASE_URL")
 
+if not DATABASE_URL:
+    print("❌ ERROR: DATABASE_URL environment variable is not set!")
+    # In Vercel, this will show up in the logs and help diagnose connectivity issues.
+    # We raise an Informative error instead of just letting create_engine fail with None.
+    raise ValueError("DATABASE_URL is missing. Please set it in your environment or Vercel dashboard.")
+
 # Serverless-optimised for Vercel + Supabase pooler (port 6543)
 # Low pool_size prevents connection exhaustion when many Vercel instances run concurrently
 engine = create_engine(
