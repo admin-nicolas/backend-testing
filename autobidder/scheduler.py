@@ -67,12 +67,119 @@ class AutoBidderSchedulerMixin:
         if user_id in self._user_backoff_until:
             del self._user_backoff_until[user_id]
 
-    async def _loop(self):
-        """Main bidding loop that handles multiple users in parallel"""
-        logger.info("AutoBidder Loop Initiated (Multi-User Parallel Mode)")
+    async def run_cycle_batch(self):
+        """Execute one parallel bidding cycle for all enabled users (Single Iteration)"""
+        logger.info("AutoBidder Cycle Batch Initiated")
         
         from database import SessionLocal
         from models import AutoBidSettings as DBAutoBidSettings
+        
+        db = SessionLocal()
+        results_summary = {
+            "total_enabled_users": 0,
+            "active_users": [],
+            "successful_bids": 0,
+            "failed_users": 0,
+            "skipped_users": 0,
+            "timestamp": datetime.now().isoformat()
+        }
+        
+        try:
+            # Fetch ALL enabled auto-bid settings
+            enabled_settings = db.query(DBAutoBidSettings).filter(
+                DBAutoBidSettings.enabled == True
+            ).all()
+            
+            results_summary["total_enabled_users"] = len(enabled_settings)
+            
+            if not enabled_settings:
+                logger.info("😴 No users have auto-bidding enabled")
+                return results_summary
+            
+            logger.info(f"👥 Found {len(enabled_settings)} users with auto-bidding enabled")
+            
+            # Prepare tasks for parallel processing
+            tasks = []
+            
+            for db_setting in enabled_settings:
+                user_id = db_setting.user_id
+                
+                # Convert DB model to dict settings
+                settings = {
+                    "enabled": db_setting.enabled,
+                    "daily_bids": db_setting.daily_bids,
+                    "currencies": db_setting.currencies,
+                    "frequency_minutes": db_setting.frequency_minutes,
+                    "max_project_bids": db_setting.max_project_bids,
+                    "smart_bidding": db_setting.smart_bidding,
+                    "min_skill_match": getattr(db_setting, 'min_skill_match', 1),
+                    "commission_projects": getattr(db_setting, 'commission_projects', True)
+                }
+                
+                # Check if user should be skipped due to frequency limits
+                if self._should_skip_user(user_id, settings):
+                    results_summary["skipped_users"] += 1
+                    continue
+                
+                logger.info(f"🔄 Adding User {user_id} to parallel processing queue")
+                results_summary["active_users"].append(user_id)
+                
+                # Create task for parallel execution
+                task = asyncio.create_task(self._run_bid_cycle(user_id, settings))
+                tasks.append((user_id, task))
+            
+            # Process all users in parallel
+            if tasks:
+                logger.info(f"🚀 Processing {len(tasks)} users in parallel...")
+                
+                # Run all users simultaneously
+                results = await asyncio.gather(*[task for _, task in tasks], return_exceptions=True)
+                
+                # Update last bid times for successful bids and handle results
+                current_time = datetime.now()
+                
+                for i, (user_id, _) in enumerate(tasks):
+                    result = results[i]
+                    
+                    if isinstance(result, Exception):
+                        logger.error(f"❌ User {user_id}: Exception during parallel processing: {result}")
+                        self._handle_user_failure(user_id)
+                        results_summary["failed_users"] += 1
+                    elif result is True:  # Successful bid
+                        self._user_last_bid_time[user_id] = current_time
+                        self._handle_user_success(user_id)
+                        results_summary["successful_bids"] += 1
+                        logger.info(f"✅ User {user_id}: Successful bid placed in parallel processing")
+                    elif result == "BID_LIMIT_REACHED":
+                        logger.error(f"🚫 User {user_id}: Bid limit reached during parallel processing")
+                        self._handle_user_failure(user_id)
+                        results_summary["failed_users"] += 1
+                    elif result == "CREDENTIALS_EXPIRED":
+                        logger.error(f"🔐 User {user_id}: Credentials expired during parallel processing")
+                        self._handle_user_failure(user_id)
+                        results_summary["failed_users"] += 1
+                    else:
+                        logger.info(f"ℹ️  User {user_id}: No bid placed during parallel processing")
+                        self._handle_user_failure(user_id)
+                        results_summary["failed_users"] += 1
+                
+                logger.info(f"📊 Batch complete: {results_summary['successful_bids']}/{len(tasks)} users placed successful bids")
+            else:
+                logger.info("⏭️  No users ready for processing this batch")
+            
+            return results_summary
+            
+        except Exception as e:
+            logger.error(f"Error in run_cycle_batch: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            return results_summary
+        finally:
+            db.close()
+
+    async def _loop(self):
+        """Main bidding loop that handles multiple users in parallel"""
+        logger.info("AutoBidder Loop Initiated (Multi-User Parallel Mode)")
         
         # Enhanced monitoring variables
         consecutive_empty_cycles = 0
@@ -88,129 +195,50 @@ class AutoBidderSchedulerMixin:
                     logger.info(f"💓 AutoBidder heartbeat - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')} - Service running normally")
                     last_heartbeat_time = current_time
                 
-                db = SessionLocal()
+                # Execute one cycle batch
+                results = await self.run_cycle_batch()
                 
-                try:
-                    # Fetch ALL enabled auto-bid settings
-                    enabled_settings = db.query(DBAutoBidSettings).filter(
-                        DBAutoBidSettings.enabled == True
-                    ).all()
-                    
-                    if not enabled_settings:
-                        logger.info("😴 No users have auto-bidding enabled. Sleeping...")
-                        await asyncio.sleep(30)
-                        continue
-                    
-                    logger.info(f"👥 Found {len(enabled_settings)} users with auto-bidding enabled")
-                    
-                    # Prepare tasks for parallel processing
-                    tasks = []
-                    active_users = []
-                    
-                    for db_setting in enabled_settings:
-                        user_id = db_setting.user_id
-                        
-                        # Convert DB model to dict settings
-                        settings = {
-                            "enabled": db_setting.enabled,
-                            "daily_bids": db_setting.daily_bids,
-                            "currencies": db_setting.currencies,
-                            "frequency_minutes": db_setting.frequency_minutes,
-                            "max_project_bids": db_setting.max_project_bids,
-                            "smart_bidding": db_setting.smart_bidding,
-                            "min_skill_match": getattr(db_setting, 'min_skill_match', 1),
-                            "commission_projects": getattr(db_setting, 'commission_projects', True)
-                        }
-                        
-                        # Check if user should be skipped due to frequency limits
-                        if self._should_skip_user(user_id, settings):
-                            continue
-                        
-                        logger.info(f"🔄 Adding User {user_id} to parallel processing queue")
-                        active_users.append(user_id)
-                        
-                        # Create task for parallel execution
-                        task = asyncio.create_task(self._run_bid_cycle(user_id, settings))
-                        tasks.append((user_id, task))
-                    
-                    # Process all users in parallel
-                    if tasks:
-                        logger.info(f"🚀 Processing {len(tasks)} users in parallel (different skills = different projects)...")
-                        
-                        # Run all users simultaneously
-                        results = await asyncio.gather(*[task for _, task in tasks], return_exceptions=True)
-                        
-                        # Update last bid times for successful bids and handle results
-                        current_time = datetime.now()
-                        successful_bids = 0
-                        
-                        for i, (user_id, _) in enumerate(tasks):
-                            result = results[i]
-                            
-                            if isinstance(result, Exception):
-                                logger.error(f"❌ User {user_id}: Exception during parallel processing: {result}")
-                                self._handle_user_failure(user_id)
-                            elif result is True:  # Successful bid
-                                self._user_last_bid_time[user_id] = current_time
-                                self._handle_user_success(user_id)
-                                successful_bids += 1
-                                logger.info(f"✅ User {user_id}: Successful bid placed in parallel processing")
-                            elif result == "BID_LIMIT_REACHED":
-                                logger.error(f"🚫 User {user_id}: Bid limit reached during parallel processing")
-                                self._handle_user_failure(user_id)
-                            elif result == "CREDENTIALS_EXPIRED":
-                                logger.error(f"🔐 User {user_id}: Credentials expired during parallel processing")
-                                self._handle_user_failure(user_id)
-                            else:
-                                logger.info(f"ℹ️  User {user_id}: No bid placed during parallel processing")
-                                self._handle_user_failure(user_id)
-                        
-                        logger.info(f"📊 Parallel processing complete: {successful_bids}/{len(tasks)} users placed successful bids")
-                        
-                        # Enhanced monitoring
-                        cycle_count += 1
-                        if successful_bids > 0:
-                            consecutive_empty_cycles = 0
-                            last_successful_bid_time = current_time
-                        else:
-                            consecutive_empty_cycles += 1
-                        
-                        # Alert if no bids for too long
-                        if consecutive_empty_cycles >= 10:  # 10 cycles without bids
-                            logger.warning(f"🚨 ALERT: {consecutive_empty_cycles} consecutive cycles without successful bids!")
-                            logger.warning(f"🚨 Last successful bid: {last_successful_bid_time}")
-                            # Could send webhook alert here
-                        
-                        # Periodic health check
-                        if cycle_count % 20 == 0:  # Every 20 cycles
-                            await self._health_check_report(enabled_settings, consecutive_empty_cycles)
-                    else:
-                        logger.info("⏭️  No users ready for processing this cycle")
-                        
-                finally:
-                    db.close()
+                successful_bids = results["successful_bids"]
+                active_users_count = len(results["active_users"])
                 
-                # Smart wait time: Check frequently enough for the most active user
-                # but don't check too often to waste resources
-                if enabled_settings:
-                    min_frequency_minutes = min(setting.frequency_minutes for setting in enabled_settings)
-                    # Wait for 1/2 of the minimum frequency, but at least 2 minutes, max 5 minutes
-                    smart_wait_minutes = max(2, min(5, min_frequency_minutes / 2))
-                    wait_seconds = int(smart_wait_minutes * 60)
-                    logger.info(f"✅ Parallel cycle complete for users {active_users}. Next check in {smart_wait_minutes} minutes ({wait_seconds}s) - min user frequency: {min_frequency_minutes}m")
+                # Enhanced monitoring
+                cycle_count += 1
+                if successful_bids > 0:
+                    consecutive_empty_cycles = 0
+                    last_successful_bid_time = datetime.now()
                 else:
-                    wait_seconds = 120  # Check every 120 seconds if no users enabled
-                    logger.info(f"✅ No enabled users. Waiting {wait_seconds} seconds...")
+                    consecutive_empty_cycles += 1
                 
+                # Alert if no bids for too long
+                if consecutive_empty_cycles >= 10:  # 10 cycles without bids
+                    logger.warning(f"🚨 ALERT: {consecutive_empty_cycles} consecutive cycles without successful bids!")
+                
+                # Periodic health check every 20 cycles
+                if cycle_count % 20 == 0:
+                    # Fetch settings again for health check report
+                    from database import SessionLocal
+                    from models import AutoBidSettings as DBAutoBidSettings
+                    db = SessionLocal()
+                    try:
+                        enabled_settings = db.query(DBAutoBidSettings).filter(DBAutoBidSettings.enabled == True).all()
+                        await self._health_check_report(enabled_settings, consecutive_empty_cycles)
+                    finally:
+                        db.close()
+                
+                # Smart wait time
+                wait_seconds = 300  # Default 5 minutes
+                if results["total_enabled_users"] > 0:
+                    wait_seconds = 120  # Fast check if users available
+                
+                logger.info(f"✅ Cycle {cycle_count} complete. Waiting {wait_seconds}s...")
                 await asyncio.sleep(wait_seconds)
                 
             except asyncio.CancelledError:
                 break
             except Exception as e:
-                logger.error(f"Error in AutoBidder parallel loop: {e}")
-                import traceback
-                logger.error(traceback.format_exc())
+                logger.error(f"Error in AutoBidder loop: {e}")
                 await asyncio.sleep(60)
+
 
     async def _health_check_report(self, enabled_settings, consecutive_empty_cycles):
         """Generate health check report for monitoring"""

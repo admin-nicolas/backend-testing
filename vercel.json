@@ -1,0 +1,8 @@
+{
+  "crons": [
+    {
+      "path": "/api/autobid/run-cycle",
+      "schedule": "*/5 * * * *"
+    }
+  ]
+}

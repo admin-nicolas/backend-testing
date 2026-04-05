@@ -30,6 +30,22 @@ async def autobid_heartbeat():
         "message": "AutoBidder service heartbeat"
     }
 
+@router.get("/api/autobid/run-cycle")
+async def run_autobid_cycle():
+    """Trigger a single bidding cycle for all enabled users (for Cron jobs)"""
+    try:
+        results = await autobidder.run_cycle_batch()
+        return {
+            "success": True,
+            "results": results
+        }
+    except Exception as e:
+        print(f"Error running autobid cycle: {e}")
+        return {
+            "success": False,
+            "error": str(e)
+        }
+
 @router.get("/api/autobid/stats")
 async def get_autobid_stats(email: str = Depends(verify_token), db: Session = Depends(get_db)):
     try:
